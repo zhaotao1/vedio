@@ -43,11 +43,16 @@ looping:
 # conv3d in one shot, allocating ~78 GB and OOM-ing the A100. Verified:
 # 32/8/512/64 OOMs at first chunk; 16/8/384/64 keeps per-tile workspace
 # below ~10 GB and decodes the full 1486-frame timeline.
+# NOTE: spatial_tile_pixels MUST be < min(height, width) in pixel space,
+# else the VAE's outer tile-prep ends up with tile_size == axis_length and
+# no spatial tiling happens, so the deep upsampled stages run F.conv3d on
+# the full (B, C, T, H, W) tensor and OOM at ~78 GB. 64 px tiles produce
+# per-tile peak ~26 GB which fits comfortably in 80 GB.
 vae_tiling:
   temporal_tile_frames: 16
   temporal_overlap_frames: 8
-  spatial_tile_pixels: 384
-  spatial_overlap_pixels: 64
+  spatial_tile_pixels: 64
+  spatial_overlap_pixels: 32
 
 prompts:
   - "Aerial wide shot soaring over a vast Jurassic valley at sunrise, lush primeval ferns, towering ancient conifers, distant volcanic mountains exhaling thin smoke, cinematic golden hour lighting, photorealistic, slow forward camera motion."
