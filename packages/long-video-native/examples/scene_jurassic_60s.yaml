@@ -1,0 +1,46 @@
+# 侏罗纪场景 ~60s 测试
+# 14 段 × 121 帧 (重叠 2 latent ≈ 16 像素帧)
+# 总帧数 = 121 + 13 × (121 - 16) = 1486 帧
+# 时长 = 1486 / 24 ≈ 61.9 秒
+
+model:
+  distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors
+  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root:                /root/sj-tmp/models/gemma-3-12b
+  loras: []
+  quantization: fp8-cast
+  offload: cpu
+  compile: false
+
+common:
+  height:      512
+  width:       768
+  frame_rate:  24.0
+  seed:        0
+  output_path: /tmp/scene_jurassic_60s.mp4
+
+looping:
+  chunk_num_frames: 121         # 8*15+1, 每段 ≈5s
+  overlap_latent_frames: 2
+  overlap_strength: 0.5
+  enable_negative_index: true
+  negative_index_anchor_latent_frames: 2
+  negative_index_strength: 0.3
+  negative_frame_offset: -16
+  adain_factor: 0.5
+
+prompts:
+  - "Aerial wide shot soaring over a vast Jurassic valley at sunrise, lush primeval ferns, towering ancient conifers, distant volcanic mountains exhaling thin smoke, cinematic golden hour lighting, photorealistic, slow forward camera motion."
+  - "The camera descends through morning mist into a dense fern-covered jungle, shafts of warm sunlight breaking through giant ginkgo leaves, dewdrops glittering, a small flock of pterosaurs gliding across the frame, photorealistic, smooth dolly-in."
+  - "A massive herd of long-necked Brachiosaurus wading through a wide shallow river, water splashing around their legs, ripples catching the sunlight, lush vegetation on both banks, epic wide shot, cinematic, slow lateral pan."
+  - "Close-up of a Brachiosaurus lowering its enormous head to drink, water droplets falling from its lips, scales and wet skin texture in fine detail, soft warm rim light, shallow depth of field, photorealistic."
+  - "A grazing herd of Triceratops emerges from a clearing, dust kicking up under their feet, sunlight catching on their horns and frills, distant Brachiosaurus visible in the background, epic establishing shot, slow tracking camera."
+  - "Sudden tension: the herd freezes, ears twitching; the camera slowly tilts up to a dark treeline where ferns begin to tremble, dramatic shadowy lighting, ominous mood, photorealistic."
+  - "A towering Tyrannosaurus Rex bursts out from the trees in slow motion, mouth open with a deafening roar, leaves and dust exploding outward, dramatic side lighting, cinematic low-angle shot, photorealistic."
+  - "The Triceratops herd stampedes across the plain, ground shaking, T-Rex chasing through the dust cloud, fast tracking shot following the action from the side, motion blur, golden afternoon light, photorealistic."
+  - "A lone Triceratops turns to face the T-Rex, lowering its head and horns defensively, dust swirling around them, dramatic standoff, low-angle close-up, intense cinematic lighting, photorealistic."
+  - "Wide shot of the two giants clashing in slow motion, horns striking the T-Rex's flank, the T-Rex roaring and stumbling, dirt and grass flying, epic cinematic action, golden hour light."
+  - "Overhead drone shot pulling back to reveal the prehistoric valley, the T-Rex retreating into the jungle, Triceratops herd regrouping, river glittering in late afternoon sun, sweeping camera move, photorealistic."
+  - "Sunset over the Jurassic landscape, sky turning orange and purple, silhouettes of Brachiosaurus walking along the ridge line, peaceful epic vista, slow lateral camera glide, cinematic."
+  - "Night falls; bioluminescent insects light up the ferns, a full moon rises over the volcanic mountains, distant dinosaur calls echoing, calm wide shot, painterly cinematic lighting, photorealistic."
+  - "Final aerial pull-back shot rising high above the valley, revealing the entire Jurassic ecosystem under starlight, sweeping orchestral feeling, slow upward camera motion, photorealistic, epic finale."
