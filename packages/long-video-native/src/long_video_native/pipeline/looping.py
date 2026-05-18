@@ -664,10 +664,50 @@ def _streaming_video_decode(
             # 2. Decode through the existing tiled-decode path. The inner
             #    ``tiling_config`` already chops further into VAE tiles; the
             #    macro-chunk just bounds how much latent is GPU-resident.
-            decoded_parts = [
-                frames.detach().to("cpu", non_blocking=False)
-                for frames in decoder.decode_video(chunk_gpu, tiling_config, generator)
-            ]
+            # On the FIRST chunk only, enable CUDA memory snapshot so an OOM
+            # produces an attributed allocation dump we can analyse offline.
+            if i == 0:
+                try:
+                    torch.cuda.memory._record_memory_history(max_entries=200_000)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("[streaming-decode] could not enable memory history: %s", _e)
+            try:
+                decoded_parts = [
+                    frames.detach().to("cpu", non_blocking=False)
+                    for frames in decoder.decode_video(chunk_gpu, tiling_config, generator)
+                ]
+            except torch.cuda.OutOfMemoryError:
+                snap_path = "/tmp/streaming_decode_oom_snapshot.pickle"
+                try:
+                    torch.cuda.memory._dump_snapshot(snap_path)
+                    logger.error(
+                        "[streaming-decode] OOM at chunk %d/%d; snapshot dumped to %s",
+                        i + 1, len(ranges), snap_path,
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.error("[streaming-decode] OOM but snapshot dump failed: %s", _e)
+                # also dump memory_stats
+                try:
+                    stats = torch.cuda.memory_stats()
+                    logger.error(
+                        "[streaming-decode] memory_stats: active.all.current=%d (%.2f GB), "
+                        "active.all.peak=%d (%.2f GB), allocation.all.current=%d, allocation.all.peak=%d",
+                        stats.get("active.all.current", -1),
+                        stats.get("active_bytes.all.current", 0) / 1024**3,
+                        stats.get("active.all.peak", -1),
+                        stats.get("active_bytes.all.peak", 0) / 1024**3,
+                        stats.get("allocation.all.current", -1),
+                        stats.get("allocation.all.peak", -1),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            finally:
+                if i == 0:
+                    try:
+                        torch.cuda.memory._record_memory_history(enabled=None)
+                    except Exception:  # noqa: BLE001
+                        pass
             del chunk_gpu
             torch.cuda.empty_cache()
 
