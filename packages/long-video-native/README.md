@@ -1,0 +1,80 @@
+# long-video-native
+
+Pure `ltx-pipelines` implementation of the ComfyUI `LTXVLoopingSampler` long-video
+strategy. **No ComfyUI dependency, no ltx-core modifications.**
+
+## Features
+
+- **Temporal tiling** with latent half-noise overlap (`temporal_overlap_cond_strength`)
+- **Spatial tiling** for high-resolution generation (cosine-blended weights)
+- **AdaIN** colour drift correction across segments (latent space)
+- **Per-segment prompts** (one prompt per chunk, supports prompt evolution)
+- **Negative-index latent** long-term memory via `VideoConditionByKeyframeIndex`
+  (uses the already-supported negative `frame_idx` path in ltx-core)
+- **Image keyframes** at arbitrary positions (per-tile reprojection in spatial mode)
+- **YAML config** + CLI runner
+
+## Install
+
+```bash
+cd packages/long-video-native
+pip install -e .
+```
+
+`ltx-core` and `ltx-pipelines` must already be installed in the environment.
+
+## Quick start
+
+```bash
+ltxv-long-video --config scene.yaml
+```
+
+See `scene.yaml.example` for the schema.
+
+## Architecture
+
+```
+long_video_native/
+├── core/
+│   ├── adain.py              # latent-space AdaIN colour alignment
+│   ├── blending.py           # temporal & 2-D cosine blend weights
+│   ├── conditioning_builder.py  # construct VideoConditionByKeyframeIndex sets
+│   └── state.py              # TileMemory: per-(v,h) prev-tail latent cache
+├── pipeline/
+│   ├── looping.py            # LoopingPipeline: temporal MVP + negative-index
+│   └── spatial_tiled.py      # SpatialTiledLoopingPipeline wrapper
+├── runner.py                 # CLI / YAML entrypoint
+└── __init__.py
+```
+
+## Mapping to ComfyUI LTXVLoopingSampler
+
+| ComfyUI param | long-video-native equivalent |
+|---|---|
+| `temporal_tile_size` | `chunk_num_frames` |
+| `temporal_overlap` | `overlap_latent_frames` × 8 |
+| `temporal_overlap_cond_strength` | `overlap_strength` |
+| `tile_width` / `tile_height` | `tile_width_px` / `tile_height_px` |
+| `spatial_overlap` | `spatial_overlap_px` |
+| `adain_factor` | `adain_factor` |
+| `optional_negative_index` | `negative_frame_offset` (negative pixel-frame integer) |
+| `optional_negative_index_strength` | `negative_index_strength` |
+| `optional_cond_images` + `optional_cond_image_indices` | `keyframes_per_segment` list in YAML |
+| `optional_positive_conditionings` (per-chunk) | `prompts` list in YAML |
+
+## Notes & Caveats
+
+- **Stage 1 / Stage 2 resolution**: previous-tail and negative-index anchor latents
+  are spatially resized via trilinear interpolation when injected into Stage 1
+  (which runs at half resolution). The full-resolution latents are used as-is
+  in Stage 2.
+- **Audio**: per-segment audio latents are simply concatenated along the time
+  axis. There is no cross-segment audio overlap handling in ltx-core; if you
+  hear seams, post-process externally.
+- **Spatial-tile audio**: in spatial tiling mode, audio is generated only by
+  the centre tile to avoid `V*H`-fold redundant generation, since the audio
+  output is global to the scene rather than spatially localised.
+- **Negative-index requires `frame_offset < 0`**: enforced in `LoopingConfig.__post_init__`.
+- **`spatial_overlap_px` must be divisible by 32** (VAE spatial scale).
+- **`chunk_num_frames` must satisfy `(N-1) % 8 == 0`** (VAE temporal scale).
+- **`height` / `width` must be divisible by 64** (two-stage Stage 2 requirement).

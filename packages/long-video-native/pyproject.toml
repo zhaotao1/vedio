@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "long-video-native"
+version = "0.1.0"
+description = "Pure ltx-pipelines implementation of long-video looping sampler (temporal + spatial tiling, AdaIN, negative-index latent memory)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "LTX long-video-native contributors" }]
+dependencies = [
+    "torch>=2.3",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-xdist>=3"]
+
+[project.scripts]
+ltxv-long-video = "long_video_native.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"

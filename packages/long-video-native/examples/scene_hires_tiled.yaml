@@ -1,0 +1,39 @@
+# 高分辨率 + 空间分块示例 (2×2 tile grid)
+# 总分辨率 1408x2432 ≈ 3.4MP, 每段会跑 4 次 generate_one_segment
+# 用法: ltxv-long-video --config examples/scene_hires_tiled.yaml
+
+model:
+  distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-1.1.safetensors
+  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root:                /root/sj-tmp/models/gemma-3-12b  
+  loras: []
+  quantization: fp8-cast
+  offload: cpu                # 高分辨率几乎必须开
+  compile: false
+
+common:
+  height:      1408           # = 2 × tile_height_px
+  width:       2432           # = 2 × tile_width_px
+  frame_rate:  24.0
+  seed:        42
+  output_path: ./out/hires_long.mp4
+
+looping:
+  chunk_num_frames: 121
+  overlap_latent_frames: 3
+  overlap_strength: 0.6       # 高分辨率下接缝更明显, 适当提高
+  enable_negative_index: true
+  negative_index_anchor_latent_frames: 2
+  negative_index_strength: 0.3
+  negative_frame_offset: -16
+  adain_factor: 0.6
+
+spatial_tiling:
+  tile_height_px:     704
+  tile_width_px:      1216
+  spatial_overlap_px: 128     # 必须 32 倍数
+
+prompts:
+  - "Wide cinematic establishing shot of a misty mountain valley at dawn"
+  - "Camera slowly pushes forward through the valley, mist swirling"
+  - "Reveal a small village in the distance, smoke rising from chimneys"

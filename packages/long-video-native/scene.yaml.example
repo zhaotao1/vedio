@@ -1,0 +1,51 @@
+# Example scene config for long-video-native.
+# Copy & edit, then run:
+#   ltxv-long-video --config scene.yaml
+
+model:
+  distilled_checkpoint_path: ~/models/ltxv2/distilled.safetensors
+  spatial_upsampler_path: ~/models/ltxv2/upsampler.safetensors
+  gemma_root: ~/models/gemma-3
+  # loras: [["~/models/character_lora.safetensors", 0.8]]
+  loras: []
+  quantization: null              # null | fp8-cast | fp8-scaled-mm
+  offload: none                   # none | cpu | disk
+  compile: false
+
+common:
+  height: 704                     # must be divisible by 64 (two-stage)
+  width: 1216                     # must be divisible by 64
+  frame_rate: 24.0
+  seed: 42
+  output_path: ./out/long_demo.mp4
+  enhance_prompt: false
+
+looping:
+  chunk_num_frames: 121           # 8K+1 (24 fps × ≈5 s per segment)
+  overlap_latent_frames: 3        # = 24 pixel frames overlap
+  overlap_strength: 0.5           # ComfyUI temporal_overlap_cond_strength
+  enable_negative_index: true     # long-term memory anchor
+  negative_index_anchor_latent_frames: 2
+  negative_index_strength: 0.3
+  negative_frame_offset: -16      # pixel frames; must be < 0
+  adain_factor: 0.5               # 0 disables, 1 fully matches first segment
+
+# Omit `spatial_tiling:` block entirely for single-tile generation.
+# Enable below for high-resolution (e.g. 1408×2432) renders.
+# spatial_tiling:
+#   tile_height_px: 704
+#   tile_width_px: 1216
+#   spatial_overlap_px: 128       # must be a multiple of 32 (VAE scale)
+
+prompts:
+  - "A woman walks into a neon-lit cafe at night, slow tracking shot"
+  - "She sits at the bar; the bartender pours hot coffee into a ceramic cup"
+  - "She takes a slow sip, steam rising; soft amber rim light"
+  - "She looks out the rainy window, thoughtful; reflections shimmer"
+
+# Optional, aligned with `prompts`:
+# keyframes_per_segment:
+#   - []
+#   - [["./refs/anchor_seg1.png", 0, 0.9]]
+#   - []
+#   - []

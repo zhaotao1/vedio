@@ -1,0 +1,79 @@
+# =============================================================================
+# long-video-native scene config
+# 用法: ltxv-long-video --config scene.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 模型权重 (路径支持 ~ 展开)
+# -----------------------------------------------------------------------------
+model:
+  distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-1.1.safetensors
+  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root:                /root/sj-tmp/models/gemma-3-12b        # prompt encoder
+
+  loras: []
+  # 例: [["~/models/style.safetensors", 0.8], ["~/models/char.safetensors", 1.0]]
+
+  quantization: fp8-cast      # null | fp8-cast | fp8-scaled-mm
+  offload: none               # none | cpu | disk
+  compile: false              # torch.compile, 首次编译慢但后续提速
+
+# -----------------------------------------------------------------------------
+# 通用参数 (分辨率 / fps / 输出)
+# -----------------------------------------------------------------------------
+common:
+  height:      704            # 必须 64 倍数 (两阶段要求)
+  width:       1216           # 必须 64 倍数
+  frame_rate:  24.0
+  seed:        42
+  output_path: ./out/long.mp4
+  enhance_prompt: false       # 走 ltx-pipelines 的 prompt 增强 (仅第 1 段)
+
+# -----------------------------------------------------------------------------
+# 段间循环 (核心)
+# -----------------------------------------------------------------------------
+looping:
+  # 每段像素帧数, 必须 8K+1; 24fps 下 121=5s, 161=6.7s, 241=10s
+  chunk_num_frames: 121
+
+  # 段间重叠 (单位: 潜在帧, 1 潜在帧 ≈ 8 像素帧)
+  # 3 = 24 像素帧 = 1s 的过渡; 越大越平滑但代价是有效时长缩短
+  overlap_latent_frames: 3
+  overlap_strength: 0.5       # 0~1, ↑接缝更平滑, 过大会损失多样性
+
+  # 远段长期记忆 (negative-index latent)
+  # 开启后会把首段开头的几帧注入到后续每段的"虚拟过去"位置
+  enable_negative_index: true
+  negative_index_anchor_latent_frames: 2
+  negative_index_strength: 0.3
+  negative_frame_offset: -16  # 必须 < 0 (单位: 像素帧)
+
+  # 色彩漂移修正 (latent 空间 AdaIN, 与首段对齐)
+  adain_factor: 0.5           # 0 关闭, 0.5 推荐, 1.0 强制
+
+# -----------------------------------------------------------------------------
+# 空间分块 (高分辨率时启用; 不需要则整段注释掉)
+# -----------------------------------------------------------------------------
+# spatial_tiling:
+#   tile_height_px:     704   # 必须 64 倍数
+#   tile_width_px:      1216  # 必须 64 倍数
+#   spatial_overlap_px: 128   # 必须 32 倍数 (VAE 空间压缩)
+
+# -----------------------------------------------------------------------------
+# 每段 prompt (段数 = 列表长度)
+# -----------------------------------------------------------------------------
+prompts:
+  - "A woman walks into a neon-lit cafe at night, slow tracking shot"
+  - "She sits at the bar; the bartender pours hot coffee into a ceramic cup"
+  - "She takes a slow sip, steam rising; soft amber rim light on her face"
+  - "She looks out the rainy window, thoughtful; neon reflections shimmer"
+
+# -----------------------------------------------------------------------------
+# 可选: 每段 keyframe (长度必须与 prompts 一致, 不用则整段省略)
+# 格式: [图片路径, 帧索引, strength, crf?]
+# -----------------------------------------------------------------------------
+# keyframes_per_segment:
+#   - [["./refs/woman_front.png", 0, 0.9]]
+#   - []
+#   - [["./refs/coffee_closeup.png", 60, 0.7]]
+#   - []

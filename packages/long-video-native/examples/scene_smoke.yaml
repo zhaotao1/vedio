@@ -1,0 +1,30 @@
+# 最小烟囱测试 — 用最低分辨率/最短段数验证流程能跑通
+# 24GB 卡 + offload:cpu 应该都能跑
+# 用法: ltxv-long-video --config examples/scene_smoke.yaml --log-level INFO
+
+model:
+  distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-1.1.safetensors
+  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
+  gemma_root:                /root/sj-tmp/models/gemma-3-12b  
+  loras: []
+  quantization: fp8-cast
+  offload: cpu
+  compile: false
+
+common:
+  height:      320            # 64 倍数, 最小可用
+  width:       512
+  frame_rate:  24.0
+  seed:        0
+  output_path: /tmp/smoke.mp4
+
+looping:
+  chunk_num_frames: 41        # 8*5+1, 每段 ≈1.7s
+  overlap_latent_frames: 2
+  overlap_strength: 0.5
+  enable_negative_index: false
+  adain_factor: 0.5
+
+prompts:
+  - "a cat walks across a sunny rug, slow tracking"
+  - "the cat sits down and yawns, sunlight warming its fur"
