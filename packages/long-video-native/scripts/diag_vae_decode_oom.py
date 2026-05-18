@@ -57,13 +57,18 @@ def main() -> int:
         TilingConfig,
     )
 
+    import os  # noqa: PLC0415
+    spt = int(os.environ.get("SPT", "64"))   # spatial tile pixels (min 64, %32==0)
+    tpt = int(os.environ.get("TPT", "16"))   # temporal tile frames (min 16, %8==0)
+    tpo = int(os.environ.get("TPO", "8"))    # temporal overlap frames (%8==0)
+    spo = int(os.environ.get("SPO", "32"))   # spatial overlap pixels (%32==0)
     # Exact config the failing run used (16/8 temporal, 384/64 spatial)
     tiling = TilingConfig(
         spatial_config=SpatialTilingConfig(
-            tile_size_in_pixels=384, tile_overlap_in_pixels=64
+            tile_size_in_pixels=spt, tile_overlap_in_pixels=spo
         ),
         temporal_config=TemporalTilingConfig(
-            tile_size_in_frames=16, tile_overlap_in_frames=8
+            tile_size_in_frames=tpt, tile_overlap_in_frames=tpo
         ),
     )
     log.info("tiling: %s", tiling)
