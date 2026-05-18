@@ -289,6 +289,30 @@ class LoopingPipeline(DistilledPipeline):
         del all_audio_latents
 
         # --- decode --------------------------------------------------------
+        # Critical for streaming: force a hard cleanup barrier before we
+        # touch the VAE decoder. After 14 segments of stage-1 + stage-2 the
+        # CUDA caching allocator can be holding tens of GB of *allocated*
+        # blocks (not just reserved) — observed at 78 GB on 80 GB A100 even
+        # with offload=cpu — which leaves the streaming decoder no room to
+        # build its own weights + tile workspace. Drop unused tensors,
+        # finalize all pending CUDA work, then drain the cache twice.
+        if config.streaming_decode and anchor_latent is not None:
+            # ``anchor_latent`` was kept on GPU between segments for the
+            # negative-index path. Once generation is done it is dead weight.
+            anchor_latent = None
+        if full_video_latent.device.type == "cpu":
+            # ``full_audio_latent`` is small (~5MB); ok to ship to GPU later.
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(
+                "[long-video] post-generation cleanup: cuda mem allocated=%.2f GB reserved=%.2f GB",
+                torch.cuda.memory_allocated() / 1024**3,
+                torch.cuda.memory_reserved() / 1024**3,
+            )
+
         logger.info(
             "[long-video] assembled latent shape video=%s audio=%s "
             "(device=%s); decoding (streaming=%s)...",
@@ -298,6 +322,27 @@ class LoopingPipeline(DistilledPipeline):
             config.streaming_decode,
         )
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        # Decode audio BEFORE entering the video-decode persistent context.
+        # The audio path builds + frees its own decoder + vocoder via
+        # ``gpu_model``; doing it first means by the time the video VAE
+        # comes up, those weights are guaranteed to be on the ``meta``
+        # device. We also pull the resulting audio tensor to CPU so it does
+        # not occupy GPU memory during the long video decode.
+        if full_audio_latent.device.type != self.device.type:
+            full_audio_latent = full_audio_latent.to(self.device, non_blocking=False)
+        decoded_audio = self.audio_decoder(full_audio_latent)
+        del full_audio_latent
+        if hasattr(decoded_audio, "data") and hasattr(decoded_audio.data, "device") and decoded_audio.data.device.type != "cpu":
+            decoded_audio = decoded_audio._replace(data=decoded_audio.data.to("cpu")) if hasattr(decoded_audio, "_replace") else decoded_audio
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(
+            "[long-video] post-audio-decode cleanup: cuda mem allocated=%.2f GB reserved=%.2f GB",
+            torch.cuda.memory_allocated() / 1024**3,
+            torch.cuda.memory_reserved() / 1024**3,
+        )
 
         if config.streaming_decode:
             decoded_video = _streaming_video_decode(
@@ -313,11 +358,6 @@ class LoopingPipeline(DistilledPipeline):
             decoded_video = self.video_decoder(
                 full_video_latent, tiling_config, generator
             )
-        # Audio latent is tiny; ship back to GPU for the audio decoder which
-        # internally rebuilds + frees its own model.
-        if full_audio_latent.device.type != self.device.type:
-            full_audio_latent = full_audio_latent.to(self.device, non_blocking=False)
-        decoded_audio = self.audio_decoder(full_audio_latent)
         return decoded_video, decoded_audio
 
     # ------------------------------------------------------ single-segment
