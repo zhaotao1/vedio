@@ -17,9 +17,21 @@ def mix_one(shot, scene_bgm):
     bgm = scene_bgm.get(shot.get("scene_id"))
     sfx_files = sorted(base.glob("sfx_*.wav"))
     inputs = ["-i", str(video)]; filters = []; amix_in = []; idx = 1
+    dlg_meta = shot.get("dialogue") or []
     for vi, voice in enumerate(voices):
         inputs += ["-i", str(voice)]
-        filters.append(f"[{idx}:a]volume=1.0[v{vi}]"); amix_in.append(f"[v{vi}]"); idx += 1
+        # 从文件名 dialog_NN_speaker.wav 取序号，对齐 shot.dialogue[NN].start
+        try:
+            n = int(voice.stem.split("_")[1])
+        except Exception:
+            n = vi
+        start = float(dlg_meta[n].get("start", 0.0)) if n < len(dlg_meta) else 0.0
+        d = int(start * 1000)
+        if d > 0:
+            filters.append(f"[{idx}:a]adelay={d}|{d},volume=1.0[v{vi}]")
+        else:
+            filters.append(f"[{idx}:a]volume=1.0[v{vi}]")
+        amix_in.append(f"[v{vi}]"); idx += 1
     if bgm and bgm.is_file():
         dur = shot.get("duration", 5)
         inputs += ["-i", str(bgm)]
