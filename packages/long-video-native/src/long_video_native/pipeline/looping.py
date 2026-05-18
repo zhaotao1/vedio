@@ -107,7 +107,18 @@ class LoopingPipeline(DistilledPipeline):
 
     # ---------------------------------------------------------------- public
 
-    @torch.inference_mode()
+    # NOTE: we deliberately use ``@torch.no_grad()`` rather than
+    # ``@torch.inference_mode()`` here because ``self.video_decoder(...)``
+    # returns a *lazy* iterator that is consumed later by ``encode_video``
+    # in the runner — i.e. after this function (and therefore the
+    # inference-mode context) has already exited. Inference-mode tensors
+    # produced inside this scope would then be illegal to feed into
+    # autograd-enabled ops (the VAE decoder weights have
+    # ``requires_grad=True``), triggering:
+    #   RuntimeError: Inference tensors cannot be saved for backward.
+    # ``torch.no_grad()`` gives us the same gradient suppression without
+    # marking tensors as inference-only, so deferred decoding works.
+    @torch.no_grad()
     def generate_long(
         self,
         prompts: list[str],
@@ -239,7 +250,10 @@ class LoopingPipeline(DistilledPipeline):
 
     # ------------------------------------------------------ single-segment
 
-    @torch.inference_mode()
+    # See note on ``generate_long``: ``no_grad`` instead of
+    # ``inference_mode`` so the returned latents can be safely fed into
+    # the lazy video-decoder iterator after this function returns.
+    @torch.no_grad()
     def generate_one_segment(
         self,
         *,
