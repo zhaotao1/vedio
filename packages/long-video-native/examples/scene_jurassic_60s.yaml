@@ -29,6 +29,14 @@ looping:
   negative_frame_offset: -16
   adain_factor: 0.5
 
+# Shrink the video VAE temporal tile so the mid-block conv3d workspace
+# fits in 80GB at 1486 frames. Default is 80/24 which OOMs on A100-80GB.
+vae_tiling:
+  temporal_tile_frames: 32
+  temporal_overlap_frames: 8
+  spatial_tile_pixels: 512
+  spatial_overlap_pixels: 64
+
 prompts:
   - "Aerial wide shot soaring over a vast Jurassic valley at sunrise, lush primeval ferns, towering ancient conifers, distant volcanic mountains exhaling thin smoke, cinematic golden hour lighting, photorealistic, slow forward camera motion."
   - "The camera descends through morning mist into a dense fern-covered jungle, shafts of warm sunlight breaking through giant ginkgo leaves, dewdrops glittering, a small flock of pterosaurs gliding across the frame, photorealistic, smooth dolly-in."

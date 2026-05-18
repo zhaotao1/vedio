@@ -262,7 +262,56 @@ def main() -> None:
     enhance_prompt = bool(common.get("enhance_prompt", False))
 
     keyframes_per_segment = _parse_keyframes(keyframes_cfg, len(prompts))
-    tiling_config = TilingConfig.default()
+
+    # --- VAE tiling config (optional yaml override) -----------------------
+    # The video VAE decoder is the single biggest memory hog at decode time;
+    # for long videos at A100-80GB the default 80-frame temporal tile can
+    # OOM during the mid-block conv3d workspace allocation. Allow the user
+    # to shrink the tile sizes via yaml:
+    #   vae_tiling:
+    #     temporal_tile_frames: 32   # default 80, must be >=16 and %8==0
+    #     temporal_overlap_frames: 8 # default 24, must be %8==0 and < tile
+    #     spatial_tile_pixels: 512   # default 768, must be >=64 and %32==0
+    #     spatial_overlap_pixels: 32 # default 64, must be %32==0
+    vae_tiling_yaml = cfg.get("vae_tiling") or {}
+    default_tiling = TilingConfig.default()
+    from ltx_core.model.video_vae.tiling import (  # noqa: PLC0415
+        SpatialTilingConfig as VaeSpatialTilingConfig,
+    )
+    from ltx_core.model.video_vae.tiling import (  # noqa: PLC0415
+        TemporalTilingConfig as VaeTemporalTilingConfig,
+    )
+
+    tiling_config = TilingConfig(
+        spatial_config=VaeSpatialTilingConfig(
+            tile_size_in_pixels=int(
+                vae_tiling_yaml.get(
+                    "spatial_tile_pixels",
+                    default_tiling.spatial_config.tile_size_in_pixels,
+                )
+            ),
+            tile_overlap_in_pixels=int(
+                vae_tiling_yaml.get(
+                    "spatial_overlap_pixels",
+                    default_tiling.spatial_config.tile_overlap_in_pixels,
+                )
+            ),
+        ),
+        temporal_config=VaeTemporalTilingConfig(
+            tile_size_in_frames=int(
+                vae_tiling_yaml.get(
+                    "temporal_tile_frames",
+                    default_tiling.temporal_config.tile_size_in_frames,
+                )
+            ),
+            tile_overlap_in_frames=int(
+                vae_tiling_yaml.get(
+                    "temporal_overlap_frames",
+                    default_tiling.temporal_config.tile_overlap_in_frames,
+                )
+            ),
+        ),
+    )
 
     # --- run --------------------------------------------------------------
     if spatial_yaml:
