@@ -10,14 +10,17 @@ def mix_one(shot, scene_bgm):
     base = project_dir(f"03_shots/{sid}")
     video = base / "video.mp4"
     if not video.exists(): print(f"[skip] {sid} no video"); return
-    voice = base / "voice.wav"
+    # 支持 voice.wav（旧）或 dialog_*.wav（Qwen3-TTS 输出）
+    voices = sorted(base.glob("dialog_*.wav"))
+    if not voices and (base / "voice.wav").exists():
+        voices = [base / "voice.wav"]
     bgm = scene_bgm.get(shot.get("scene_id"))
     sfx_files = sorted(base.glob("sfx_*.wav"))
     inputs = ["-i", str(video)]; filters = []; amix_in = []; idx = 1
-    if voice.exists():
+    for vi, voice in enumerate(voices):
         inputs += ["-i", str(voice)]
-        filters.append(f"[{idx}:a]volume=1.0[v]"); amix_in.append("[v]"); idx += 1
-    if bgm and bgm.exists():
+        filters.append(f"[{idx}:a]volume=1.0[v{vi}]"); amix_in.append(f"[v{vi}]"); idx += 1
+    if bgm and bgm.is_file():
         dur = shot.get("duration", 5)
         inputs += ["-i", str(bgm)]
         filters.append(f"[{idx}:a]atrim=0:{dur},afade=t=in:st=0:d=0.3,"
@@ -35,9 +38,15 @@ def mix_one(shot, scene_bgm):
     if not amix_in:
         subprocess.run(["ffmpeg", "-y", "-i", str(video), "-c", "copy", str(out)],
                        check=True, capture_output=True); return
-    filt = ";".join(filters) + (f";{''.join(amix_in)}amix=inputs={len(amix_in)}:"
-                                f"duration=first:dropout_transition=0,"
-                                f"loudnorm=I=-16:TP=-1.5:LRA=11[a]")
+    if len(amix_in) == 1:
+        # 单音轨：直接用，不走 amix
+        last = amix_in[0]
+        filters.append(f"{last}loudnorm=I=-16:TP=-1.5:LRA=11[a]")
+    else:
+        filters.append(f"{''.join(amix_in)}amix=inputs={len(amix_in)}:"
+                       f"duration=first:dropout_transition=0,"
+                       f"loudnorm=I=-16:TP=-1.5:LRA=11[a]")
+    filt = ";".join(filters)
     print(f"[mix] {sid} ({len(amix_in)} tracks)")
     subprocess.run(["ffmpeg", "-y", *inputs, "-filter_complex", filt,
                     "-map", "0:v", "-map", "[a]",
@@ -48,7 +57,7 @@ def main():
     cfg = load_config()
     shots = read_jsonl(project_dir("01_script") / "shots.jsonl")
     bgm_dir = project_dir("02_assets/bgm")
-    scene_bgm = {p.stem: p for p in bgm_dir.glob("*.wav")}
+    scene_bgm = {p.stem: p for p in bgm_dir.glob("*.wav") if p.is_file()}
     for shot in shots:
         try: mix_one(shot, scene_bgm)
         except Exception as e: print(f"  [err] {shot['shot_id']}: {e}")
