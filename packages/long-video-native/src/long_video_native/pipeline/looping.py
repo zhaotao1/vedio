@@ -91,6 +91,24 @@ class LoopingConfig:
     streaming_chunk_latent_frames: int = 32   # latent frames per decode macro-chunk
     streaming_overlap_latent_frames: int = 4  # latent-frame overlap between macro-chunks
 
+    # --- Grid-tiled VAE decode (ComfyUI-style spatial tiling) -------------
+    # When ``vae_grid_horizontal_tiles`` or ``vae_grid_vertical_tiles`` > 1
+    # the streaming decoder splits each temporal macro-chunk into an
+    # H × W grid in latent space, decodes each grid tile *independently*
+    # with the un-tiled VAE (i.e. ``tiling_config=None``), and blends the
+    # tiles back together with linear ramps over the overlap region.
+    #
+    # This bypasses ltx-core's ``tiled_decode`` entirely (which has a
+    # workspace-allocation bug at small spatial tile sizes) and gives a
+    # predictable GPU-memory budget per tile.
+    #
+    # ``vae_grid_overlap_latent`` is the per-side overlap *in latent
+    # pixels* (1 latent pixel = 32 pixel pixels on H/W). Set to 0 to
+    # disable blending (raw tile stitching — may show seams).
+    vae_grid_horizontal_tiles: int = 1
+    vae_grid_vertical_tiles: int = 1
+    vae_grid_overlap_latent: int = 2
+
     # Stage sigmas (override only for advanced experimentation)
     stage_1_sigmas: torch.Tensor = field(default_factory=lambda: DISTILLED_SIGMAS)
     stage_2_sigmas: torch.Tensor = field(default_factory=lambda: STAGE_2_DISTILLED_SIGMAS)
@@ -115,6 +133,10 @@ class LoopingConfig:
                 )
             if self.streaming_overlap_latent_frames < 0:
                 raise ValueError("streaming_overlap_latent_frames must be >= 0")
+        if self.vae_grid_horizontal_tiles < 1 or self.vae_grid_vertical_tiles < 1:
+            raise ValueError("vae_grid_*_tiles must be >= 1")
+        if self.vae_grid_overlap_latent < 0:
+            raise ValueError("vae_grid_overlap_latent must be >= 0")
 
 
 class LoopingPipeline(DistilledPipeline):
@@ -353,6 +375,9 @@ class LoopingPipeline(DistilledPipeline):
                 overlap_latent_frames=config.streaming_overlap_latent_frames,
                 device=self.device,
                 generator=generator,
+                grid_horizontal_tiles=config.vae_grid_horizontal_tiles,
+                grid_vertical_tiles=config.vae_grid_vertical_tiles,
+                grid_overlap_latent=config.vae_grid_overlap_latent,
             )
         else:
             decoded_video = self.video_decoder(
@@ -556,6 +581,132 @@ def _maybe_resize_latent(
 
 # VAE temporal compression factor: 1 latent frame ↔ 8 pixel frames.
 _VAE_TEMPORAL_SCALE = 8
+# VAE spatial compression factor: 1 latent pixel ↔ 32 image pixels (H/W).
+_VAE_SPATIAL_SCALE = 32
+
+
+def _grid_tiled_decode_chunk(
+    decoder,
+    chunk_gpu: torch.Tensor,        # (B, C, T_lat, H_lat, W_lat) on GPU
+    *,
+    horizontal_tiles: int,
+    vertical_tiles: int,
+    overlap_latent: int,
+    generator: torch.Generator | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """Decode one temporal macro-chunk using ComfyUI-style spatial grid tiling.
+
+    Splits ``chunk_gpu`` into a ``vertical_tiles × horizontal_tiles`` grid
+    in latent H/W, decodes each tile *independently* via the un-tiled VAE,
+    and accumulates the per-tile pixel output into a single CPU tensor
+    using a linear blend ramp over the per-side ``overlap_latent`` border.
+
+    Returns: CPU tensor of shape ``(F_px, H_px, W_px, C)`` (float, [0, 1]).
+    """
+    b, c, t_lat, h_lat, w_lat = chunk_gpu.shape
+    assert b == 1, f"grid tiled decode expects batch=1, got {b}"
+
+    t_px = (t_lat - 1) * _VAE_TEMPORAL_SCALE + 1  # LTX VAE temporal output = (T-1)*8+1
+    h_px = h_lat * _VAE_SPATIAL_SCALE
+    w_px = w_lat * _VAE_SPATIAL_SCALE
+    overlap_px = overlap_latent * _VAE_SPATIAL_SCALE
+
+    # Latent-grid coordinates: each tile is `tile_h × tile_w` core + overlap on each interior side.
+    # Compute even base sizes (rounded down) and distribute remainder.
+    def _split_ranges(total: int, n_tiles: int, ov: int) -> list[tuple[int, int, int, int]]:
+        """Returns list of (lat_start, lat_end, core_start, core_end) per tile.
+
+        - lat_start/lat_end: latent slice fed to the VAE (includes overlap).
+        - core_start/core_end: latent indices in the *output coord system* this
+          tile is responsible for (used to place the tile into the canvas).
+        """
+        if n_tiles <= 1:
+            return [(0, total, 0, total)]
+        base = total // n_tiles
+        rem = total - base * n_tiles
+        ranges: list[tuple[int, int, int, int]] = []
+        cursor = 0
+        for i in range(n_tiles):
+            core_len = base + (1 if i < rem else 0)
+            core_start = cursor
+            core_end = cursor + core_len
+            lat_start = max(0, core_start - ov)
+            lat_end = min(total, core_end + ov)
+            ranges.append((lat_start, lat_end, core_start, core_end))
+            cursor = core_end
+        return ranges
+
+    v_ranges = _split_ranges(h_lat, vertical_tiles, overlap_latent)
+    h_ranges = _split_ranges(w_lat, horizontal_tiles, overlap_latent)
+
+    # Output canvas on CPU + weight canvas on CPU. We use float32 to avoid
+    # blend precision loss; final cast happens at the end.
+    out_cpu = torch.zeros((t_px, h_px, w_px, 3), dtype=torch.float32)
+    weight_cpu = torch.zeros((1, h_px, w_px, 1), dtype=torch.float32)
+
+    n_tiles_total = vertical_tiles * horizontal_tiles
+    tile_idx = 0
+    for vi, (v_lat_s, v_lat_e, v_core_s, v_core_e) in enumerate(v_ranges):
+        for hi, (h_lat_s, h_lat_e, h_core_s, h_core_e) in enumerate(h_ranges):
+            tile_idx += 1
+            tile_latent = chunk_gpu[:, :, :, v_lat_s:v_lat_e, h_lat_s:h_lat_e].contiguous()
+            logger.info(
+                "[grid-decode] tile %d/%d (v=%d,h=%d) latent shape=%s allocated=%.2f GB",
+                tile_idx, n_tiles_total, vi, hi, tuple(tile_latent.shape),
+                torch.cuda.memory_allocated() / 1024**3,
+            )
+            # Un-tiled decode of this small tile.
+            decoded_parts = list(decoder.decode_video(tile_latent, None, generator))
+            del tile_latent
+            # Each yielded chunk is (f, h, w, c) on GPU.
+            tile_pix_gpu = torch.cat(decoded_parts, dim=0) if len(decoded_parts) > 1 else decoded_parts[0]
+            del decoded_parts
+            tile_pix_cpu = tile_pix_gpu.detach().to("cpu", non_blocking=False).float()
+            del tile_pix_gpu
+            torch.cuda.empty_cache()
+
+            # Pixel coordinates for this tile's latent slice.
+            tile_h_px = (v_lat_e - v_lat_s) * _VAE_SPATIAL_SCALE
+            tile_w_px = (h_lat_e - h_lat_s) * _VAE_SPATIAL_SCALE
+            # Sanity (last latent row/col may be off if total is odd vs scale, but LTX always 32-aligned).
+            assert tile_pix_cpu.shape[1] == tile_h_px, (
+                f"tile pixel H mismatch: {tile_pix_cpu.shape[1]} vs {tile_h_px}"
+            )
+            assert tile_pix_cpu.shape[2] == tile_w_px, (
+                f"tile pixel W mismatch: {tile_pix_cpu.shape[2]} vs {tile_w_px}"
+            )
+
+            # Build a 2D linear-ramp blend mask for this tile in pixel space.
+            mask = torch.ones((1, tile_h_px, tile_w_px, 1), dtype=torch.float32)
+            # Vertical ramp (top/bottom):
+            if vi > 0 and overlap_px > 0:
+                ramp = torch.linspace(0.0, 1.0, overlap_px, dtype=torch.float32).view(1, -1, 1, 1)
+                mask[:, :overlap_px, :, :] *= ramp
+            if vi < vertical_tiles - 1 and overlap_px > 0:
+                ramp = torch.linspace(1.0, 0.0, overlap_px, dtype=torch.float32).view(1, -1, 1, 1)
+                mask[:, -overlap_px:, :, :] *= ramp
+            # Horizontal ramp (left/right):
+            if hi > 0 and overlap_px > 0:
+                ramp = torch.linspace(0.0, 1.0, overlap_px, dtype=torch.float32).view(1, 1, -1, 1)
+                mask[:, :, :overlap_px, :] *= ramp
+            if hi < horizontal_tiles - 1 and overlap_px > 0:
+                ramp = torch.linspace(1.0, 0.0, overlap_px, dtype=torch.float32).view(1, 1, -1, 1)
+                mask[:, :, -overlap_px:, :] *= ramp
+
+            # Paste into canvas.
+            y0 = v_lat_s * _VAE_SPATIAL_SCALE
+            y1 = y0 + tile_h_px
+            x0 = h_lat_s * _VAE_SPATIAL_SCALE
+            x1 = x0 + tile_w_px
+            out_cpu[:, y0:y1, x0:x1, :] += tile_pix_cpu * mask
+            weight_cpu[:, y0:y1, x0:x1, :] += mask
+
+            del tile_pix_cpu, mask
+
+    weight_cpu = weight_cpu.clamp_min(1e-8)
+    out_cpu = out_cpu / weight_cpu
+    return out_cpu.to(torch.float32)
 
 
 def _streaming_video_decode(
@@ -567,6 +718,9 @@ def _streaming_video_decode(
     overlap_latent_frames: int,
     device: torch.device,
     generator: torch.Generator | None,
+    grid_horizontal_tiles: int = 1,
+    grid_vertical_tiles: int = 1,
+    grid_overlap_latent: int = 2,
 ) -> Iterator[torch.Tensor]:
     """Stream-decode a CPU-resident full latent in temporal macro-chunks.
 
@@ -597,6 +751,14 @@ def _streaming_video_decode(
             full_latent_cpu.device,
         )
 
+    use_grid = grid_horizontal_tiles > 1 or grid_vertical_tiles > 1
+    if use_grid:
+        logger.info(
+            "[streaming-decode] using ComfyUI-style spatial grid tiling: "
+            "%dx%d (overlap_latent=%d)",
+            grid_vertical_tiles, grid_horizontal_tiles, grid_overlap_latent,
+        )
+
     t_lat = full_latent_cpu.shape[2]
     if chunk_latent_frames >= t_lat:
         # Whole timeline fits in one macro-chunk — just ship and decode.
@@ -608,12 +770,25 @@ def _streaming_video_decode(
         )
         with video_decoder.persistent() as decoder:
             chunk_gpu = full_latent_cpu.to(device, non_blocking=False)
-            for frames in decoder.decode_video(chunk_gpu, tiling_config, generator):
-                # Move to CPU before yielding so the next decoder tile has
-                # room. ``encode_video`` consumes CPU/GPU equally well.
-                yield frames.detach().to("cpu", non_blocking=False)
-            del chunk_gpu
-            torch.cuda.empty_cache()
+            if use_grid:
+                decoded_cpu = _grid_tiled_decode_chunk(
+                    decoder, chunk_gpu,
+                    horizontal_tiles=grid_horizontal_tiles,
+                    vertical_tiles=grid_vertical_tiles,
+                    overlap_latent=grid_overlap_latent,
+                    generator=generator,
+                    device=device,
+                )
+                del chunk_gpu
+                torch.cuda.empty_cache()
+                yield decoded_cpu
+            else:
+                for frames in decoder.decode_video(chunk_gpu, tiling_config, generator):
+                    # Move to CPU before yielding so the next decoder tile has
+                    # room. ``encode_video`` consumes CPU/GPU equally well.
+                    yield frames.detach().to("cpu", non_blocking=False)
+                del chunk_gpu
+                torch.cuda.empty_cache()
         return
 
     stride = chunk_latent_frames - overlap_latent_frames
@@ -672,10 +847,21 @@ def _streaming_video_decode(
                 except Exception as _e:  # noqa: BLE001
                     logger.warning("[streaming-decode] could not enable memory history: %s", _e)
             try:
-                decoded_parts = [
-                    frames.detach().to("cpu", non_blocking=False)
-                    for frames in decoder.decode_video(chunk_gpu, tiling_config, generator)
-                ]
+                if use_grid:
+                    decoded_cpu = _grid_tiled_decode_chunk(
+                        decoder, chunk_gpu,
+                        horizontal_tiles=grid_horizontal_tiles,
+                        vertical_tiles=grid_vertical_tiles,
+                        overlap_latent=grid_overlap_latent,
+                        generator=generator,
+                        device=device,
+                    )
+                    decoded_parts = None  # not used in grid path
+                else:
+                    decoded_parts = [
+                        frames.detach().to("cpu", non_blocking=False)
+                        for frames in decoder.decode_video(chunk_gpu, tiling_config, generator)
+                    ]
             except torch.cuda.OutOfMemoryError:
                 snap_path = "/tmp/streaming_decode_oom_snapshot.pickle"
                 try:
@@ -711,8 +897,10 @@ def _streaming_video_decode(
             del chunk_gpu
             torch.cuda.empty_cache()
 
-            decoded_cpu = torch.cat(decoded_parts, dim=0)  # (f, h, w, c)
-            del decoded_parts
+            if not use_grid:
+                decoded_cpu = torch.cat(decoded_parts, dim=0)  # (f, h, w, c)
+                del decoded_parts
+            # In grid mode, decoded_cpu is already produced by _grid_tiled_decode_chunk.
 
             is_last = i == len(ranges) - 1
 

@@ -259,6 +259,15 @@ def main() -> None:
         streaming_overlap_latent_frames=int(
             looping_yaml.get("streaming_overlap_latent_frames", 4)
         ),
+        vae_grid_horizontal_tiles=int(
+            looping_yaml.get("vae_grid_horizontal_tiles", 1)
+        ),
+        vae_grid_vertical_tiles=int(
+            looping_yaml.get("vae_grid_vertical_tiles", 1)
+        ),
+        vae_grid_overlap_latent=int(
+            looping_yaml.get("vae_grid_overlap_latent", 2)
+        ),
     )
 
     height = int(common.get("height", 704))

@@ -36,18 +36,21 @@ looping:
   streaming_chunk_latent_frames: 16
   streaming_overlap_latent_frames: 2
 
-# Shrink the video VAE tile so the final conv3d workspace fits in 80GB.
-# Critical: temporal_tile_frames MUST be < streaming_chunk_latent_frames
-# (32 above) so the VAE's internal tiling actually splits each macro-chunk.
-# When the two are equal (e.g. both 32) the whole macro-chunk goes through
-# conv3d in one shot, allocating ~78 GB and OOM-ing the A100. Verified:
-# 32/8/512/64 OOMs at first chunk; 16/8/384/64 keeps per-tile workspace
-# below ~10 GB and decodes the full 1486-frame timeline.
-# NOTE: spatial_tile_pixels MUST be < min(height, width) in pixel space,
-# else the VAE's outer tile-prep ends up with tile_size == axis_length and
-# no spatial tiling happens, so the deep upsampled stages run F.conv3d on
-# the full (B, C, T, H, W) tensor and OOM at ~78 GB. 64 px tiles produce
-# per-tile peak ~26 GB which fits comfortably in 80 GB.
+  # ComfyUI-style spatial grid tiling for the VAE decode (bypasses
+  # ltx-core's buggy `tiled_decode`). Splits each macro-chunk latent into
+  # a vertical_tiles × horizontal_tiles grid, decodes each tile via the
+  # un-tiled VAE, and blends with linear ramps over the overlap region.
+  # For 512×768 (latent 16×24) a 2×2 grid → per-tile latent ~8×12 →
+  # peak GPU well under 80 GB even with all 14 segments accumulating
+  # fragmentation. overlap_latent=2 = 64 pixel-px overlap each side.
+  vae_grid_vertical_tiles: 2
+  vae_grid_horizontal_tiles: 2
+  vae_grid_overlap_latent: 2
+
+# vae_tiling is kept only as a fallback for the chunk_latent_frames >= t_lat
+# single-shot path; with grid tiling enabled above it is unused on the
+# per-chunk path. We still ship a small spatial tile so any internal
+# ltx-core code that consults it does not OOM.
 vae_tiling:
   temporal_tile_frames: 16
   temporal_overlap_frames: 8
