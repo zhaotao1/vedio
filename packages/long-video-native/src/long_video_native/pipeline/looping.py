@@ -634,6 +634,13 @@ def _streaming_video_decode(
         "%d total latent frames)",
         len(ranges), chunk_latent_frames, overlap_latent_frames, t_lat,
     )
+    if tiling_config is None:
+        logger.warning("[streaming-decode] tiling_config is None — VAE will run un-tiled. This is the OOM path.")
+    else:
+        logger.info(
+            "[streaming-decode] tiling_config: temporal=%s spatial=%s",
+            tiling_config.temporal_config, tiling_config.spatial_config,
+        )
 
     with video_decoder.persistent() as decoder:
         logger.info(
