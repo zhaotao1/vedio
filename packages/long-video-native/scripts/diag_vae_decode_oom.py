@@ -74,12 +74,14 @@ def main() -> int:
     torch.cuda.memory._record_memory_history(max_entries=200_000)
     report("startup")
 
-    log.info("Building VideoDecoder (memory_efficient=True)…")
+    import os  # noqa: PLC0415
+    mem_eff = os.environ.get("MEM_EFF", "1") != "0"
+    log.info("Building VideoDecoder (memory_efficient=%s)…", mem_eff)
     decoder_block = VideoDecoder(
         checkpoint_path=distilled,
         dtype=dtype,
         device=device,
-        memory_efficient=True,
+        memory_efficient=mem_eff,
     )
 
     # Exact shape of the failing chunk: (1, 128, 16, 16, 24)
