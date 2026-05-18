@@ -1,0 +1,32 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# 生成物（体积大，不入库）
+project/02_assets/
+project/03_shots/
+project/04_audio/
+project/05_final/
+project/**/*.png
+project/**/*.jpg
+project/**/*.jpeg
+project/**/*.wav
+project/**/*.mp3
+project/**/*.mp4
+project/**/*.mov
+
+# 保留脚本/分镜等小文件
+!project/01_script/**
+
+# 模型/缓存
+models/
+*.safetensors
+*.ckpt
+*.bin
+
+# 日志
+*.log
+run_*.log

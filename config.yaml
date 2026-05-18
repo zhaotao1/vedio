@@ -1,0 +1,33 @@
+api_keys:
+  doubao_ark: "60db306c-5580-4923-b562-173e76e8f7ae"
+  doubao_base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  minimax: "sk-api-5gAO_ZwyK9ycybVWXkIWCz34STLmiMSxxI5VMT0Vu2dRkKoAfxTs2KNdHHYk6zU9cik9ebQiO98RWT96CfbZZBidg5R7RZPNJyVHaLa1D8nOVJBG16Typ4M"
+  minimax_group_id: ""
+  minimax_base_url: "https://api.minimaxi.com"
+
+doubao:
+  llm_model: "doubao-seed-2-0-pro-260215"
+  image_model: "doubao-seedream-4-5-251128"
+
+minimax:
+  tts_model: "speech-02-hd"
+
+local_models:
+  ltx_video: "/root/sj-tmp/models/ltx-video"
+  qwen3_tts: "/root/sj-tmp/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+  stable_audio_open: "/root/sj-tmp/models/stable-audio-open-1.0"
+
+style:
+  global_prompt_suffix: "shot on 35mm film, anamorphic lens, cinematic color grading, shallow depth of field, dramatic lighting"
+  resolution: "2560x1440"
+  fps: 24
+  shot_duration_default: 5
+
+multi_character:
+  prefer_shot_reverse_shot: true
+  two_shot_method: "doubao_fusion"
+  three_plus_method: "ffmpeg_compose"
+
+output:
+  project_root: "./project"
+  final_video: "./project/04_final/movie_final.mp4"
