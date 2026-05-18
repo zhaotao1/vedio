@@ -69,11 +69,6 @@ def main() -> int:
         ),
         temporal_config=TemporalTilingConfig(
             tile_size_in_frames=tpt, tile_overlap_in_frames=tpo
-        spatial_config=SpatialTilingConfig(
-            tile_size_in_pixels=spt, tile_overlap_in_pixels=spo
-        ),
-        temporal_config=TemporalTilingConfig(
-            tile_size_in_frames=tpt, tile_overlap_in_frames=tpo
         ),
     )
     log.info("tiling: %s", tiling)
