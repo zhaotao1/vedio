@@ -252,6 +252,13 @@ def main() -> None:
             looping_yaml.get("negative_frame_offset", -16)
         ),
         adain_factor=float(looping_yaml.get("adain_factor", 0.5)),
+        streaming_decode=bool(looping_yaml.get("streaming_decode", False)),
+        streaming_chunk_latent_frames=int(
+            looping_yaml.get("streaming_chunk_latent_frames", 32)
+        ),
+        streaming_overlap_latent_frames=int(
+            looping_yaml.get("streaming_overlap_latent_frames", 4)
+        ),
     )
 
     height = int(common.get("height", 704))

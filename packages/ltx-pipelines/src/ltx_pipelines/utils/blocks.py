@@ -580,6 +580,20 @@ class VideoDecoder:
         decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
         return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator), decoder)
 
+    @contextmanager
+    def persistent(self) -> Iterator[torch.nn.Module]:
+        """Build the VAE decoder once and yield it; free on context exit.
+
+        Used by streaming-decode callers that want to feed the decoder
+        multiple latent chunks (e.g. for very long videos where the full
+        latent does not fit on GPU). Each call to ``decoder.decode_video(...)``
+        inside the ``with`` block reuses the same loaded weights, avoiding
+        the per-chunk rebuild cost of ``__call__``.
+        """
+        decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+        with gpu_model(decoder) as d:
+            yield d
+
 
 # ---------------------------------------------------------------------------
 # AudioDecoder

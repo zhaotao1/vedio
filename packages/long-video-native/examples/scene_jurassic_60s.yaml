@@ -28,6 +28,13 @@ looping:
   negative_index_strength: 0.3
   negative_frame_offset: -16
   adain_factor: 0.5
+  # Level-2 streaming decode: keep assembled latent on CPU, decode in
+  # 32-latent-frame macro-chunks (≈ 256 pixel frames each) with a 4-latent
+  # cross-fade. This caps GPU residency to one chunk so the full 1486-frame
+  # timeline no longer has to live on GPU during VAE decode.
+  streaming_decode: true
+  streaming_chunk_latent_frames: 32
+  streaming_overlap_latent_frames: 4
 
 # Shrink the video VAE tile so the final conv3d workspace fits in 80GB
 # at 1486 frames. Default 80/24/768/64 OOMs in mid-block; 32/8/512/64

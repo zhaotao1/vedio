@@ -22,7 +22,9 @@ which wraps this class.
 
 from __future__ import annotations
 
+import gc
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import torch
@@ -75,6 +77,20 @@ class LoopingConfig:
     # Colour drift correction
     adain_factor: float = 0.5            # 0 disables; 1 fully matches first segment
 
+    # --- Streaming decode (Level-2 OOM mitigation) ------------------------
+    # When enabled:
+    #   * each segment's latent is moved to CPU immediately after generation
+    #     so GPU memory is bounded by a single segment, not the whole timeline
+    #   * the assembled full latent stays on CPU
+    #   * VAE decode runs macro-chunk by macro-chunk: each chunk is shipped
+    #     to GPU, decoded (using the inner tiling_config), then dropped
+    #   * consecutive macro-chunks share ``streaming_overlap_latent_frames``
+    #     latent frames which are linearly blended in pixel space to hide
+    #     the seam (8 pixel frames per latent frame, VAE temporal scale)
+    streaming_decode: bool = False
+    streaming_chunk_latent_frames: int = 32   # latent frames per decode macro-chunk
+    streaming_overlap_latent_frames: int = 4  # latent-frame overlap between macro-chunks
+
     # Stage sigmas (override only for advanced experimentation)
     stage_1_sigmas: torch.Tensor = field(default_factory=lambda: DISTILLED_SIGMAS)
     stage_2_sigmas: torch.Tensor = field(default_factory=lambda: STAGE_2_DISTILLED_SIGMAS)
@@ -92,6 +108,13 @@ class LoopingConfig:
             raise ValueError("adain_factor must be in [0, 1]")
         if self.enable_negative_index and self.negative_frame_offset >= 0:
             raise ValueError("negative_frame_offset must be < 0")
+        if self.streaming_decode:
+            if self.streaming_chunk_latent_frames <= self.streaming_overlap_latent_frames:
+                raise ValueError(
+                    "streaming_chunk_latent_frames must exceed streaming_overlap_latent_frames"
+                )
+            if self.streaming_overlap_latent_frames < 0:
+                raise ValueError("streaming_overlap_latent_frames must be >= 0")
 
 
 class LoopingPipeline(DistilledPipeline):
@@ -170,20 +193,30 @@ class LoopingPipeline(DistilledPipeline):
         # the same context to amortise the load cost.
         # NOTE: distilled pipeline calls the same stage for both stage-1 and
         # stage-2; we follow that pattern and build the context per stage.
+        #
+        # Memory note: when ``config.streaming_decode`` is True we move each
+        # finished segment latent to CPU immediately. This caps GPU residency
+        # to a single segment instead of growing linearly with the timeline,
+        # which is the key change that lets us scale past ~60s on 80GB.
         all_video_latents: list[torch.Tensor] = []
         all_audio_latents: list[torch.Tensor] = []
 
         # Anchor latent for negative-index memory is captured after segment 0.
+        # Kept on GPU because it is re-fed into the transformer each segment.
         anchor_latent: torch.Tensor | None = None
 
         for seg_idx, prompt in enumerate(prompts):
-            prev_tail = (
-                all_video_latents[-1][:, :, -config.overlap_latent_frames:, :, :]
-                .detach()
-                .clone()
-                if seg_idx > 0 and config.overlap_latent_frames > 0
-                else None
-            )
+            prev_tail = None
+            if seg_idx > 0 and config.overlap_latent_frames > 0:
+                # Tail latent must be on the active device for the next
+                # transformer pass; ship it back from CPU only when needed.
+                prev_full = all_video_latents[-1]
+                prev_tail = (
+                    prev_full[:, :, -config.overlap_latent_frames:, :, :]
+                    .to(self.device, non_blocking=False)
+                    .detach()
+                    .clone()
+                )
             logger.info(
                 "[long-video] segment %d/%d prompt=%r",
                 seg_idx + 1, len(prompts), prompt[:60],
@@ -204,17 +237,20 @@ class LoopingPipeline(DistilledPipeline):
                 config=config,
                 enhance_prompt=enhance_prompt and seg_idx == 0,  # only first
             )
+            if prev_tail is not None:
+                del prev_tail
 
-            # AdaIN against the first segment to halt colour drift.
+            # AdaIN against the first segment to halt colour drift. Pull the
+            # reference back to ``video_latent``'s device for the match; the
+            # result inherits ``video_latent.device``.
             if seg_idx > 0 and config.adain_factor > 0:
-                video_latent = adain_match(
-                    video_latent, all_video_latents[0], factor=config.adain_factor
-                )
+                ref = all_video_latents[0].to(video_latent.device, non_blocking=False)
+                video_latent = adain_match(video_latent, ref, factor=config.adain_factor)
+                del ref
 
-            all_video_latents.append(video_latent)
-            all_audio_latents.append(audio_latent)
-
-            # Snapshot the anchor from segment 0 (start of the establishing shot).
+            # Snapshot the anchor from segment 0 BEFORE moving to CPU. Anchor
+            # is small (a couple latent frames) and lives on GPU between
+            # segments.
             if seg_idx == 0 and config.enable_negative_index:
                 anchor_latent = slice_anchor(
                     video_latent,
@@ -222,12 +258,27 @@ class LoopingPipeline(DistilledPipeline):
                     from_start=True,
                 )
 
+            if config.streaming_decode:
+                video_latent = video_latent.detach().to("cpu", non_blocking=False)
+                audio_latent = audio_latent.detach().to("cpu", non_blocking=False)
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            all_video_latents.append(video_latent)
+            all_audio_latents.append(audio_latent)
+
         # --- assemble full latent timeline with overlap blending -----------
+        # Blending stays on whichever device the latents live on (CPU when
+        # streaming, GPU otherwise). ``temporal_overlap_blend`` is
+        # device-agnostic.
         full_video_latent = all_video_latents[0]
         for nxt in all_video_latents[1:]:
             full_video_latent = temporal_overlap_blend(
                 full_video_latent, nxt, overlap=config.overlap_latent_frames
             )
+        # Free the per-segment list once the assembled latent is built.
+        del all_video_latents
+
         # Audio: simple concat along the temporal frame axis. LTX-2 audio
         # latents have shape (batch, channels, frames, mel_bins); we
         # concatenate on the frame dim (-2), NOT mel_bins (-1), otherwise
@@ -235,16 +286,37 @@ class LoopingPipeline(DistilledPipeline):
         # No cross-segment overlap mechanism exists in ltx-core for audio;
         # if continuity artefacts appear, callers can post-process externally.
         full_audio_latent = torch.cat(all_audio_latents, dim=-2)
+        del all_audio_latents
 
         # --- decode --------------------------------------------------------
         logger.info(
-            "[long-video] assembled latent shape video=%s audio=%s; decoding...",
-            tuple(full_video_latent.shape), tuple(full_audio_latent.shape),
+            "[long-video] assembled latent shape video=%s audio=%s "
+            "(device=%s); decoding (streaming=%s)...",
+            tuple(full_video_latent.shape),
+            tuple(full_audio_latent.shape),
+            full_video_latent.device,
+            config.streaming_decode,
         )
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        decoded_video = self.video_decoder(
-            full_video_latent, tiling_config, generator
-        )
+
+        if config.streaming_decode:
+            decoded_video = _streaming_video_decode(
+                self.video_decoder,
+                full_video_latent,
+                tiling_config=tiling_config,
+                chunk_latent_frames=config.streaming_chunk_latent_frames,
+                overlap_latent_frames=config.streaming_overlap_latent_frames,
+                device=self.device,
+                generator=generator,
+            )
+        else:
+            decoded_video = self.video_decoder(
+                full_video_latent, tiling_config, generator
+            )
+        # Audio latent is tiny; ship back to GPU for the audio decoder which
+        # internally rebuilds + frees its own model.
+        if full_audio_latent.device.type != self.device.type:
+            full_audio_latent = full_audio_latent.to(self.device, non_blocking=False)
         decoded_audio = self.audio_decoder(full_audio_latent)
         return decoded_video, decoded_audio
 
@@ -436,3 +508,164 @@ def _maybe_resize_latent(
         align_corners=False,
     ).to(latent.dtype)
     return resized.reshape(b, c, t, target_h, target_w)
+
+
+# ---------------------------------------------------------------------------
+# Streaming decode (Level-2 OOM mitigation)
+# ---------------------------------------------------------------------------
+
+# VAE temporal compression factor: 1 latent frame ↔ 8 pixel frames.
+_VAE_TEMPORAL_SCALE = 8
+
+
+def _streaming_video_decode(
+    video_decoder,  # ltx_pipelines.utils.blocks.VideoDecoder (avoid hard import)
+    full_latent_cpu: torch.Tensor,
+    *,
+    tiling_config: TilingConfig | None,
+    chunk_latent_frames: int,
+    overlap_latent_frames: int,
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> Iterator[torch.Tensor]:
+    """Stream-decode a CPU-resident full latent in temporal macro-chunks.
+
+    The VAE decoder is built **once** and reused across all chunks via
+    ``VideoDecoder.persistent()``. Each macro-chunk is moved to GPU
+    just-in-time, decoded (with the inner ``tiling_config`` controlling
+    per-tile workspace), then dropped before the next chunk lands.
+
+    Consecutive macro-chunks share ``overlap_latent_frames`` latent frames
+    (``overlap_latent_frames * 8`` pixel frames). The overlapping pixel
+    region is linearly cross-faded so the seam is not visible.
+
+    Yields pixel-frame tensors in the same ``(f, h, w, c)`` float-in-[0,1]
+    layout as ``VideoDecoder.__call__``, suitable for direct consumption
+    by ``encode_video``.
+
+    Memory profile: GPU residency is bounded by
+        max(latent macro-chunk, single tile decode workspace)
+    independent of the total video length, which is the whole point of
+    this code path.
+    """
+    if full_latent_cpu.device.type != "cpu":
+        # We rely on the caller to have moved the assembled latent to CPU
+        # before streaming; otherwise the OOM mitigation is moot.
+        logger.warning(
+            "[streaming-decode] full_latent_cpu lives on %s, not cpu; "
+            "expected memory savings will not materialise.",
+            full_latent_cpu.device,
+        )
+
+    t_lat = full_latent_cpu.shape[2]
+    if chunk_latent_frames >= t_lat:
+        # Whole timeline fits in one macro-chunk — just ship and decode.
+        # We still use the persistent context so memory cleanup is uniform.
+        logger.info(
+            "[streaming-decode] full timeline (%d latent frames) fits in "
+            "one macro-chunk; using single-shot decode.",
+            t_lat,
+        )
+        with video_decoder.persistent() as decoder:
+            chunk_gpu = full_latent_cpu.to(device, non_blocking=False)
+            for frames in decoder.decode_video(chunk_gpu, tiling_config, generator):
+                # Move to CPU before yielding so the next decoder tile has
+                # room. ``encode_video`` consumes CPU/GPU equally well.
+                yield frames.detach().to("cpu", non_blocking=False)
+            del chunk_gpu
+            torch.cuda.empty_cache()
+        return
+
+    stride = chunk_latent_frames - overlap_latent_frames
+    overlap_px = overlap_latent_frames * _VAE_TEMPORAL_SCALE
+
+    # Build the (start, end) ranges in latent space.
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < t_lat:
+        end = min(start + chunk_latent_frames, t_lat)
+        ranges.append((start, end))
+        if end == t_lat:
+            break
+        start += stride
+
+    logger.info(
+        "[streaming-decode] %d macro-chunks (chunk=%d, overlap=%d latent frames, "
+        "%d total latent frames)",
+        len(ranges), chunk_latent_frames, overlap_latent_frames, t_lat,
+    )
+
+    with video_decoder.persistent() as decoder:
+        prev_tail_pix: torch.Tensor | None = None  # CPU, shape [overlap_px, H, W, C]
+
+        for i, (lstart, lend) in enumerate(ranges):
+            # 1. Slice + ship to GPU.
+            chunk_cpu = full_latent_cpu[:, :, lstart:lend, :, :].contiguous()
+            chunk_gpu = chunk_cpu.to(device, non_blocking=False)
+            del chunk_cpu
+
+            # 2. Decode through the existing tiled-decode path. The inner
+            #    ``tiling_config`` already chops further into VAE tiles; the
+            #    macro-chunk just bounds how much latent is GPU-resident.
+            decoded_parts = [
+                frames.detach().to("cpu", non_blocking=False)
+                for frames in decoder.decode_video(chunk_gpu, tiling_config, generator)
+            ]
+            del chunk_gpu
+            torch.cuda.empty_cache()
+
+            decoded_cpu = torch.cat(decoded_parts, dim=0)  # (f, h, w, c)
+            del decoded_parts
+
+            is_last = i == len(ranges) - 1
+
+            # 3. Stitch with previous macro-chunk's tail via linear cross-fade
+            #    over ``overlap_px`` pixel frames.
+            if prev_tail_pix is None:
+                if is_last or overlap_px == 0:
+                    logger.info(
+                        "[streaming-decode] yielded macro-chunk %d/%d (%d pixel frames)",
+                        i + 1, len(ranges), decoded_cpu.shape[0],
+                    )
+                    yield decoded_cpu
+                    prev_tail_pix = None
+                else:
+                    head_emit = decoded_cpu[:-overlap_px]
+                    prev_tail_pix = decoded_cpu[-overlap_px:].clone()
+                    logger.info(
+                        "[streaming-decode] yielded macro-chunk %d/%d head (%d pixel frames)",
+                        i + 1, len(ranges), head_emit.shape[0],
+                    )
+                    yield head_emit
+            else:
+                # Cross-fade the head of this chunk with prev_tail_pix.
+                head = decoded_cpu[:overlap_px]
+                ramp = torch.linspace(
+                    0.0, 1.0, overlap_px, dtype=decoded_cpu.dtype
+                ).view(-1, 1, 1, 1)
+                blended = prev_tail_pix * (1.0 - ramp) + head * ramp
+                logger.info(
+                    "[streaming-decode] cross-fade %d/%d (%d pixel frames)",
+                    i + 1, len(ranges), blended.shape[0],
+                )
+                yield blended
+                del head, ramp, blended
+
+                if is_last:
+                    rest = decoded_cpu[overlap_px:]
+                    logger.info(
+                        "[streaming-decode] yielded final tail %d/%d (%d pixel frames)",
+                        i + 1, len(ranges), rest.shape[0],
+                    )
+                    yield rest
+                    prev_tail_pix = None
+                else:
+                    middle = decoded_cpu[overlap_px:-overlap_px]
+                    prev_tail_pix = decoded_cpu[-overlap_px:].clone()
+                    logger.info(
+                        "[streaming-decode] yielded macro-chunk %d/%d middle (%d pixel frames)",
+                        i + 1, len(ranges), middle.shape[0],
+                    )
+                    yield middle
+
+            del decoded_cpu
