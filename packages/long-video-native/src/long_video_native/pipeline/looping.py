@@ -656,8 +656,14 @@ def _grid_tiled_decode_chunk(
                 tile_idx, n_tiles_total, vi, hi, tuple(tile_latent.shape),
                 torch.cuda.memory_allocated() / 1024**3,
             )
-            # Un-tiled decode of this small tile.
-            decoded_parts = list(decoder.decode_video(tile_latent, None, generator))
+            # Un-tiled decode of this small tile. CRITICAL: wrap in
+            # ``torch.no_grad()`` — otherwise the VAE forward retains the
+            # full autograd graph (activations of every conv3d / upsample
+            # stage) and the per-tile workspace (~11 GB) leaks across
+            # tiles. With no_grad the graph is dropped at function exit
+            # and ``empty_cache()`` actually reclaims everything.
+            with torch.no_grad():
+                decoded_parts = list(decoder.decode_video(tile_latent, None, generator))
             del tile_latent
             # Each yielded chunk is (f, h, w, c) on GPU.
             tile_pix_gpu = torch.cat(decoded_parts, dim=0) if len(decoded_parts) > 1 else decoded_parts[0]
