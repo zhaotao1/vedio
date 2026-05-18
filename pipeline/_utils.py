@@ -2,7 +2,6 @@
 from __future__ import annotations
 import os, json, yaml
 from pathlib import Path
-from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parent.parent
 CFG_PATH = ROOT / "config.yaml"
@@ -13,7 +12,9 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def doubao_client(cfg: dict | None = None) -> OpenAI:
+def doubao_client(cfg: dict | None = None):
+    # 延迟 import：mix/concat/finalize 等不需要 openai
+    from openai import OpenAI
     cfg = cfg or load_config()
     return OpenAI(
         api_key=cfg["api_keys"]["doubao_ark"],

@@ -39,13 +39,13 @@ def mix_one(shot, scene_bgm):
         subprocess.run(["ffmpeg", "-y", "-i", str(video), "-c", "copy", str(out)],
                        check=True, capture_output=True); return
     if len(amix_in) == 1:
-        # 单音轨：直接用，不走 amix
+        # 单音轨：温和归一化，避免 loudnorm 在短音频上推爆产生噪声
         last = amix_in[0]
-        filters.append(f"{last}loudnorm=I=-16:TP=-1.5:LRA=11[a]")
+        filters.append(f"{last}dynaudnorm=f=200:g=15:p=0.7:m=10[a]")
     else:
         filters.append(f"{''.join(amix_in)}amix=inputs={len(amix_in)}:"
                        f"duration=first:dropout_transition=0,"
-                       f"loudnorm=I=-16:TP=-1.5:LRA=11[a]")
+                       f"dynaudnorm=f=200:g=15:p=0.7:m=10[a]")
     filt = ";".join(filters)
     print(f"[mix] {sid} ({len(amix_in)} tracks)")
     subprocess.run(["ffmpeg", "-y", *inputs, "-filter_complex", filt,
