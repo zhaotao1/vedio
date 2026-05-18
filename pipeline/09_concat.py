@@ -14,8 +14,13 @@ def main():
     lf.write_text("\n".join(f"file '{p}'" for p in parts))
     out = project_dir("04_final") / "movie_raw.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", str(lf), "-c", "copy", str(out)], check=True)
+    # 不能用 -c copy：各 shot 的 AAC 通道数/采样率可能不一致，拼接后音轨会损坏
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lf),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000",
+        str(out)
+    ], check=True)
     print(f"[ok] → {out}")
 
 if __name__ == "__main__":
