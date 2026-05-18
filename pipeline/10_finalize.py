@@ -34,10 +34,12 @@ def main():
           f"eq=contrast=1.05:saturation=0.95")
     cmd = [
         "ffmpeg", "-y", "-i", str(raw),
-        "-vf", vf,
+        "-vf", vf + ",format=yuv420p",
         "-af", "dynaudnorm=f=200:g=15:p=0.7:m=10",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "256k", str(final),
+        "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0",
+        "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2", str(final),
     ]
     try:
         subprocess.run(cmd, check=True)
@@ -46,10 +48,12 @@ def main():
         print("[warn] subtitles burn-in failed, fallback to no-subs final")
         subprocess.run([
             "ffmpeg", "-y", "-i", str(raw),
-            "-vf", "eq=contrast=1.05:saturation=0.95",
+            "-vf", "eq=contrast=1.05:saturation=0.95,format=yuv420p",
             "-af", "dynaudnorm=f=200:g=15:p=0.7:m=10",
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-c:a", "aac", "-b:a", "256k", str(final),
+            "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0",
+            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2", str(final),
         ], check=True)
     print(f"[ok] → {final}")
 
