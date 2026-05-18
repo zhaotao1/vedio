@@ -217,10 +217,13 @@ class LoopingPipeline(DistilledPipeline):
             full_video_latent = temporal_overlap_blend(
                 full_video_latent, nxt, overlap=config.overlap_latent_frames
             )
-        # Audio: simple concat — LTX-2 audio latents are short and there is no
-        # cross-segment overlap mechanism in ltx-core for audio. If continuity
-        # artefacts appear, callers can post-process audio externally.
-        full_audio_latent = torch.cat(all_audio_latents, dim=-1)
+        # Audio: simple concat along the temporal frame axis. LTX-2 audio
+        # latents have shape (batch, channels, frames, mel_bins); we
+        # concatenate on the frame dim (-2), NOT mel_bins (-1), otherwise
+        # downstream per-channel statistics buffers shape-mismatch.
+        # No cross-segment overlap mechanism exists in ltx-core for audio;
+        # if continuity artefacts appear, callers can post-process externally.
+        full_audio_latent = torch.cat(all_audio_latents, dim=-2)
 
         # --- decode --------------------------------------------------------
         logger.info(
