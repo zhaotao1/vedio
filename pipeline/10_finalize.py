@@ -31,7 +31,7 @@ def main():
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw),
         "-vf", f"subtitles={srt}:force_style='FontName=PingFang SC,FontSize=22,Outline=1',eq=contrast=1.05:saturation=0.95",
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-af", "dynaudnorm=f=200:g=15:p=0.7:m=10",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "256k", str(final)
     ], check=True)
