@@ -36,13 +36,17 @@ looping:
   streaming_chunk_latent_frames: 32
   streaming_overlap_latent_frames: 4
 
-# Shrink the video VAE tile so the final conv3d workspace fits in 80GB
-# at 1486 frames. Default 80/24/768/64 OOMs in mid-block; 32/8/512/64
-# OOMs in final conv_out. 16/8/384/64 keeps workspace <10GB per tile.
+# Shrink the video VAE tile so the final conv3d workspace fits in 80GB.
+# Critical: temporal_tile_frames MUST be < streaming_chunk_latent_frames
+# (32 above) so the VAE's internal tiling actually splits each macro-chunk.
+# When the two are equal (e.g. both 32) the whole macro-chunk goes through
+# conv3d in one shot, allocating ~78 GB and OOM-ing the A100. Verified:
+# 32/8/512/64 OOMs at first chunk; 16/8/384/64 keeps per-tile workspace
+# below ~10 GB and decodes the full 1486-frame timeline.
 vae_tiling:
-  temporal_tile_frames: 32
+  temporal_tile_frames: 16
   temporal_overlap_frames: 8
-  spatial_tile_pixels: 512
+  spatial_tile_pixels: 384
   spatial_overlap_pixels: 64
 
 prompts:
