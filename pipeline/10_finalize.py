@@ -28,13 +28,29 @@ def main():
     raw = project_dir("04_final") / "movie_raw.mp4"
     srt = build_srt()
     final = project_dir("04_final") / "movie_final.mp4"
-    subprocess.run([
+    # 转义字幕路径里的特殊字符（: \ '）以适配 ffmpeg filtergraph
+    srt_esc = str(srt).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    vf = (f"subtitles='{srt_esc}':force_style='FontSize=22,Outline=1',"
+          f"eq=contrast=1.05:saturation=0.95")
+    cmd = [
         "ffmpeg", "-y", "-i", str(raw),
-        "-vf", f"subtitles={srt}:force_style='FontName=PingFang SC,FontSize=22,Outline=1',eq=contrast=1.05:saturation=0.95",
+        "-vf", vf,
         "-af", "dynaudnorm=f=200:g=15:p=0.7:m=10",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "256k", str(final)
-    ], check=True)
+        "-c:a", "aac", "-b:a", "256k", str(final),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        # 字幕烧录失败（缺字体/libass），退回到无字幕版本（字幕通过 movie.srt 外挂）
+        print("[warn] subtitles burn-in failed, fallback to no-subs final")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(raw),
+            "-vf", "eq=contrast=1.05:saturation=0.95",
+            "-af", "dynaudnorm=f=200:g=15:p=0.7:m=10",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-c:a", "aac", "-b:a", "256k", str(final),
+        ], check=True)
     print(f"[ok] → {final}")
 
 if __name__ == "__main__":
