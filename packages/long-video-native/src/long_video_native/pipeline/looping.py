@@ -636,6 +636,11 @@ def _streaming_video_decode(
     )
 
     with video_decoder.persistent() as decoder:
+        logger.info(
+            "[streaming-decode] decoder built on GPU: allocated=%.2f GB reserved=%.2f GB",
+            torch.cuda.memory_allocated() / 1024**3,
+            torch.cuda.memory_reserved() / 1024**3,
+        )
         prev_tail_pix: torch.Tensor | None = None  # CPU, shape [overlap_px, H, W, C]
 
         for i, (lstart, lend) in enumerate(ranges):
@@ -643,6 +648,11 @@ def _streaming_video_decode(
             chunk_cpu = full_latent_cpu[:, :, lstart:lend, :, :].contiguous()
             chunk_gpu = chunk_cpu.to(device, non_blocking=False)
             del chunk_cpu
+            logger.info(
+                "[streaming-decode] chunk %d/%d on GPU shape=%s: allocated=%.2f GB",
+                i + 1, len(ranges), tuple(chunk_gpu.shape),
+                torch.cuda.memory_allocated() / 1024**3,
+            )
 
             # 2. Decode through the existing tiled-decode path. The inner
             #    ``tiling_config`` already chops further into VAE tiles; the
