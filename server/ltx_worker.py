@@ -49,18 +49,23 @@ def _resolution(cfg_str: str | None, default=(1024, 1536)) -> tuple[int, int]:
         return default
 
 
-def build_cmd(job: dict, args) -> tuple[list[str], Path]:
+def _abs_path(p: str | os.PathLike, base: Path) -> Path:
+    """相对路径以 base 为基准转绝对路径。subprocess cwd 切到了 LTX-2 仓库，
+    所有路径必须绝对，否则 PyAV 写 mp4 会 FileNotFoundError。"""
+    pp = Path(p)
+    return pp if pp.is_absolute() else (base / pp).resolve()
+
+
+def build_cmd(job: dict, args, project_root: Path) -> tuple[list[str], Path]:
     sid = job["shot_id"]
     fps = int(job.get("fps", 24))
     duration = float(job.get("duration", 5))
     num_frames = _frames_for(duration, fps)
     height, width = _resolution(job.get("resolution"))
     seed = int(job.get("seed", 42))
-    out = Path(job.get("out_path") or (Path(args.out_root) / sid / "video.mp4"))
-    # 必须绝对路径：subprocess cwd 切到了 LTX-2 仓库
-    if not out.is_absolute():
-        out = (Path(args.out_root).resolve() / sid / "video.mp4") if not job.get("out_path") else (Path(args.out_root).resolve().parent.parent / out)
-    out = out.resolve()
+    out_root_abs = Path(args.out_root).resolve()
+    raw_out = job.get("out_path") or str(out_root_abs / sid / "video.mp4")
+    out = _abs_path(raw_out, project_root)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -82,13 +87,16 @@ def build_cmd(job: dict, args) -> tuple[list[str], Path]:
     kfs = cond.get("keyframes") or []
     for kf in kfs:
         img = kf.get("image")
-        if not img or not Path(img).exists():
-            print(f"[warn] {sid}: missing keyframe image {img}", flush=True)
+        if not img:
+            continue
+        img_abs = _abs_path(img, project_root)
+        if not img_abs.exists():
+            print(f"[warn] {sid}: missing keyframe image {img_abs}", flush=True)
             continue
         frame_idx = int(round(float(kf.get("time", 0.0)) * fps))
         frame_idx = max(0, min(frame_idx, num_frames - 1))
         strength = float(kf.get("strength", 0.9))
-        cmd += ["--image", img, str(frame_idx), str(strength)]
+        cmd += ["--image", str(img_abs), str(frame_idx), str(strength)]
 
     if args.offload:
         cmd += ["--offload", args.offload]
@@ -109,15 +117,17 @@ def main():
     ap.add_argument("--skip_existing", action="store_true")
     args = ap.parse_args()
 
-    jobs_path = Path(args.jobs)
+    jobs_path = Path(args.jobs).resolve()
+    # project_root: out_root 的上两级（…/project/03_shots → …/）
+    project_root = Path(args.out_root).resolve().parent.parent
     with open(jobs_path, "r", encoding="utf-8") as f:
         jobs = [json.loads(l) for l in f if l.strip()]
-    print(f"[ltx_worker] {len(jobs)} jobs", flush=True)
+    print(f"[ltx_worker] {len(jobs)} jobs  project_root={project_root}", flush=True)
 
     results = []
     for i, job in enumerate(jobs, 1):
         sid = job["shot_id"]
-        cmd, out = build_cmd(job, args)
+        cmd, out = build_cmd(job, args, project_root)
         if args.skip_existing and out.exists() and out.stat().st_size > 0:
             print(f"[{i}/{len(jobs)}] skip {sid} (already exists)", flush=True)
             results.append({"shot_id": sid, "status": "skipped", "out": str(out)})
