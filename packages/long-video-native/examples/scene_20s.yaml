@@ -20,7 +20,7 @@ model:
   gemma_root:             /root/sj-tmp/models/gemma-3-12b                                              # Prompt Encoder（Gemma-3-12B）
   loras: []                                                      # 额外角色/风格 LoRA：[[path, strength], ...]
   quantization: null                                             # A100(sm_80) 不支持 fp8e4nv；fp8-cast 仅 H100/L40/4090 可用
-  offload: cpu                                                   # transformer 不驻留 GPU，给 VAE workspace 让位（速度 ~1.5× 慢）
+  offload: none                                                  # 22B(44GB) + 2x2 grid VAE 已压到 ~15GB，可常驻 GPU 提速 1.5–2×；若 OOM 退回 cpu
   compile: false                                                 # torch.compile（首次编译耗时长）
 
 # ----------------------------- 管线模式 -------------------------------------
