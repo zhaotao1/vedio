@@ -5,7 +5,7 @@
 #
 # Quality knobs applied vs. previous low-res run:
 #   - resolution 512×768  → 704×1216    (~3.3× more pixels)
-#   - quantization fp8-cast → bf16       (no weight cast loss, sharper detail)
+#   - quantization fp8-cast → none       (no weight cast loss, sharper detail)
 #   - enhance_prompt false → true        (Gemma rewrites seg-0 prompt)
 #   - overlap_latent_frames 2 → 4        (smoother segment stitching)
 #   - overlap_strength 0.5 → 0.6
@@ -19,7 +19,7 @@ model:
   spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
   gemma_root:                /root/sj-tmp/models/gemma-3-12b
   loras: []
-  quantization: bf16
+  quantization: none      # bf16 weights, no fp8 cast — highest fidelity
   offload: cpu
   compile: false
 
