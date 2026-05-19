@@ -323,22 +323,55 @@ def main() -> None:
 
     # --- build configs ----------------------------------------------------
     defaults = _pipeline_defaults(mode)
+
+    # ComfyUI-aligned optional blocks (all default to legacy behaviour).
+    sampler_yaml = cfg.get("sampler") or {}
+    dyn_yaml = cfg.get("dynamic_conditioning") or {}
+    refs_yaml = cfg.get("references") or {}
+    neg_idx_yaml = cfg.get("negative_index") or {}
+
+    # P5 — optional external latent paths.
+    ext_norm_latent = None
+    ext_neg_latent = None
+    guiding_latent = None
+    norm_path = refs_yaml.get("normalizing_latents_path")
+    if norm_path:
+        from long_video_native.core.latent_io import load_reference_latent  # noqa: PLC0415
+        ext_norm_latent = load_reference_latent(str(_resolve_path(norm_path)))
+    neg_path = neg_idx_yaml.get("external_latents_path") or refs_yaml.get(
+        "negative_index_latents_path"
+    )
+    if neg_path:
+        from long_video_native.core.latent_io import load_reference_latent  # noqa: PLC0415
+        ext_neg_latent = load_reference_latent(str(_resolve_path(neg_path)))
+    guide_path = refs_yaml.get("guiding_latents_path")
+    if guide_path:
+        from long_video_native.core.latent_io import load_reference_latent  # noqa: PLC0415
+        guiding_latent = load_reference_latent(str(_resolve_path(guide_path)))
+
+    # ``negative_index:`` block overrides flat ``looping.negative_*`` keys
+    # when present (the new schema is the recommended one).
+    def _from_neg_or_loop(key: str, default):
+        if key in neg_idx_yaml:
+            return neg_idx_yaml[key]
+        legacy_map = {
+            "enabled": "enable_negative_index",
+            "anchor_latent_frames": "negative_index_anchor_latent_frames",
+            "strength": "negative_index_strength",
+            "frame_offset": "negative_frame_offset",
+        }
+        return looping_yaml.get(legacy_map[key], default)
+
     looping_config = LoopingConfig(
         chunk_num_frames=int(looping_yaml.get("chunk_num_frames", 121)),
         overlap_latent_frames=int(looping_yaml.get("overlap_latent_frames", 3)),
         overlap_strength=float(looping_yaml.get("overlap_strength", 0.5)),
-        enable_negative_index=bool(
-            looping_yaml.get("enable_negative_index", False)
-        ),
+        enable_negative_index=bool(_from_neg_or_loop("enabled", False)),
         negative_index_anchor_latent_frames=int(
-            looping_yaml.get("negative_index_anchor_latent_frames", 2)
+            _from_neg_or_loop("anchor_latent_frames", 2)
         ),
-        negative_index_strength=float(
-            looping_yaml.get("negative_index_strength", 0.3)
-        ),
-        negative_frame_offset=int(
-            looping_yaml.get("negative_frame_offset", -16)
-        ),
+        negative_index_strength=float(_from_neg_or_loop("strength", 0.3)),
+        negative_frame_offset=int(_from_neg_or_loop("frame_offset", -16)),
         adain_factor=float(looping_yaml.get("adain_factor", 0.5)),
         streaming_decode=bool(looping_yaml.get("streaming_decode", False)),
         streaming_chunk_latent_frames=int(
@@ -369,6 +402,25 @@ def main() -> None:
             guidance_yaml.get("audio"), defaults.audio_guider_params
         ),
         max_batch_size=int(guidance_yaml.get("max_batch_size", 1)),
+        # === ComfyUI alignment (opt-in via sampler:/dynamic_conditioning:/references:) ===
+        share_prompt_encoding=bool(sampler_yaml.get("share_prompt_encoding", False)),
+        use_extend_sampler=bool(sampler_yaml.get("use_extend_sampler", False)),
+        seeding_mode=str(sampler_yaml.get("seeding_mode", "per_segment_legacy")),
+        per_tile_seed_offsets=tuple(
+            int(x) for x in (sampler_yaml.get("per_tile_seed_offsets") or [])
+        ),
+        cond_image_strength=float(sampler_yaml.get("cond_image_strength", 1.0)),
+        guiding_strength=float(sampler_yaml.get("guiding_strength", 1.0)),
+        guiding_start_step=int(sampler_yaml.get("guiding_start_step", 0)),
+        guiding_end_step=int(sampler_yaml.get("guiding_end_step", 1000)),
+        dynamic_conditioning_enabled=bool(dyn_yaml.get("enabled", False)),
+        dynamic_conditioning_power=float(dyn_yaml.get("power", 1.3)),
+        dynamic_conditioning_only_first_frame=bool(
+            dyn_yaml.get("only_first_frame", True)
+        ),
+        external_normalizing_latent=ext_norm_latent,
+        external_negative_index_latent=ext_neg_latent,
+        guiding_latents=guiding_latent,
     )
 
     height = int(common.get("height", 704))
@@ -379,6 +431,42 @@ def main() -> None:
     enhance_prompt = bool(common.get("enhance_prompt", False))
 
     keyframes_per_segment = _parse_keyframes(keyframes_cfg, len(prompts))
+
+    # P1 — top-level optional ``cond_images:`` block.
+    # Items: list of {path, frame_idx, strength?} OR a 3-tuple
+    # ``[path, frame_idx, strength]``. ``frame_idx`` is a GLOBAL pixel-frame
+    # index across the whole timeline; the routing happens inside
+    # ``generate_long``.
+    cond_images_global: list[tuple] | None = None
+    raw_ci = cfg.get("cond_images") or []
+    if raw_ci:
+        cond_images_global = []
+        for entry in raw_ci:
+            if isinstance(entry, dict):
+                p = entry["path"]
+                idx = int(entry["frame_idx"])
+                strength = float(
+                    entry.get("strength", looping_config.cond_image_strength)
+                )
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                p = entry[0]
+                idx = int(entry[1])
+                strength = (
+                    float(entry[2])
+                    if len(entry) > 2
+                    else looping_config.cond_image_strength
+                )
+            else:
+                raise ValueError(
+                    f"cond_images entry must be dict or [path, frame_idx, strength?]; got {entry!r}"
+                )
+            cond_images_global.append(
+                (
+                    ImageConditioningInput(path=str(_resolve_path(p))),
+                    idx,
+                    strength,
+                )
+            )
 
     # --- VAE tiling config (optional yaml override) -----------------------
     # The video VAE decoder is the single biggest memory hog at decode time;
@@ -459,6 +547,7 @@ def main() -> None:
             width=width,
             frame_rate=frame_rate,
             keyframes_per_segment=keyframes_per_segment,
+            cond_images=cond_images_global,
             config=looping_config,
             tiling_config=tiling_config,
             enhance_prompt=enhance_prompt,

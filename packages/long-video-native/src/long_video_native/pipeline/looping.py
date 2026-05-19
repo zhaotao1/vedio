@@ -79,6 +79,21 @@ from long_video_native.core.conditioning_builder import (
     build_video_conditionings,
     slice_anchor,
 )
+from long_video_native.core.dynamic_conditioning import (
+    DynamicConditioningConfig,
+    maybe_wrap_denoiser,
+)
+from long_video_native.core.extend_conditioning import (
+    ExtendPrefixSpec,
+    build_extend_conditioning,
+)
+from long_video_native.core.keyframe_router import (
+    route_keyframes,
+    total_pixel_frames,
+)
+from long_video_native.core.prompt_cache import PromptContextCache
+from long_video_native.core.seeding import calc_tile_seed, per_tile_offset_for
+from long_video_native.core.units import VAE_TEMPORAL_SCALE
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +168,50 @@ class LoopingConfig:
     )
     max_batch_size: int = 1
 
+    # === ComfyUI LTXVLoopingSampler-aligned options (P0-P8) ===============
+    # All default-off / default to current behaviour so existing YAMLs run
+    # unchanged. See packages/long-video-native/README.md (TODO) for the
+    # full alignment story.
+
+    # P3 — Share a single PromptContextCache across all temporal+spatial
+    # tiles. Negative prompt encoded once, positives in batch. Saves time
+    # and removes encoding-noise drift between segments.
+    share_prompt_encoding: bool = False
+
+    # P4 — Use clean-prefix conditioning (``VideoConditionByLatentIndex``
+    # at strength=overlap_strength) instead of the legacy pixel-space
+    # ``temporal_overlap_blend``. Mirrors ComfyUI ``LTXVExtendSampler``.
+    # The previous tile's tail latent is pinned as a clean prefix at
+    # latent_idx=0 of the new tile, so only the remaining frames are
+    # denoised.
+    use_extend_sampler: bool = False
+
+    # P6 — DynamicConditioning: raise denoise_mask to ``power`` each step.
+    dynamic_conditioning_enabled: bool = False
+    dynamic_conditioning_power: float = 1.3
+    dynamic_conditioning_only_first_frame: bool = True
+
+    # P2 — Per-tile seed scheme.
+    #   "per_segment_legacy" — seed = base_seed + segment_idx (current default).
+    #   "comfyui"            — seed = base + start*(V*H) + v*H + h + offset.
+    seeding_mode: str = "per_segment_legacy"
+    per_tile_seed_offsets: tuple[int, ...] = ()
+
+    # P5 — Optional external reference latents (CPU tensors).
+    # When set, they override the internally captured anchor / first-tile
+    # statistics.
+    external_normalizing_latent: torch.Tensor | None = None
+    external_negative_index_latent: torch.Tensor | None = None
+
+    # P8 — IC-LoRA guiding-latents placeholder. Not yet wired into the
+    # transformer; populated by the runner so future revisions can
+    # consume it without breaking the YAML schema.
+    guiding_latents: torch.Tensor | None = None
+    guiding_strength: float = 1.0
+    guiding_start_step: int = 0
+    guiding_end_step: int = 1000
+    cond_image_strength: float = 1.0
+
     def __post_init__(self) -> None:
         if (self.chunk_num_frames - 1) % 8 != 0:
             raise ValueError(
@@ -181,6 +240,26 @@ class LoopingConfig:
             raise ValueError("num_inference_steps must be > 0")
         if self.max_batch_size <= 0:
             raise ValueError("max_batch_size must be > 0")
+        if self.seeding_mode not in ("per_segment_legacy", "comfyui"):
+            raise ValueError(
+                f"seeding_mode must be 'per_segment_legacy' or 'comfyui'; "
+                f"got {self.seeding_mode!r}"
+            )
+        if self.dynamic_conditioning_enabled and self.dynamic_conditioning_power <= 0:
+            raise ValueError("dynamic_conditioning_power must be > 0")
+        if not 0.0 <= self.guiding_strength <= 1.0:
+            raise ValueError("guiding_strength must be in [0, 1]")
+        if not 0.0 <= self.cond_image_strength <= 1.0:
+            raise ValueError("cond_image_strength must be in [0, 1]")
+        if self.guiding_latents is not None:
+            # P8 placeholder: the YAML wiring lands now so configs stay
+            # forward-compatible, but the IC-LoRA branch in the transformer
+            # is not yet hooked up. Fail loudly rather than silently
+            # ignoring user intent.
+            raise NotImplementedError(
+                "guiding_latents (IC-LoRA) is reserved for a future release; "
+                "leave references.guiding_latents_path unset for now"
+            )
 
 
 class LoopingPipeline(DistilledPipeline):
@@ -217,6 +296,7 @@ class LoopingPipeline(DistilledPipeline):
         width: int,
         frame_rate: float,
         keyframes_per_segment: list[list] | None = None,
+        cond_images: list[tuple] | None = None,
         config: LoopingConfig | None = None,
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
@@ -228,7 +308,9 @@ class LoopingPipeline(DistilledPipeline):
                 segments; total pixel frames =
                 ``len(prompts) * (chunk_num_frames - overlap_pixel_frames)
                 + overlap_pixel_frames``.
-            seed: master seed; each segment derives ``seed + segment_idx``.
+            seed: master seed; each segment derives ``seed + segment_idx``
+                (legacy mode) or the ComfyUI tile-seed formula
+                (``seeding_mode='comfyui'``).
             height, width: full output resolution (pixel). Must satisfy
                 two-stage divisibility (height/width % 64 == 0).
             frame_rate: target fps.
@@ -236,6 +318,13 @@ class LoopingPipeline(DistilledPipeline):
                 each element is a list of
                 ``ImageConditioningInput``-compatible tuples that ltx-pipelines
                 accepts (see :func:`combined_image_conditionings`).
+            cond_images: optional GLOBAL keyframes — list of
+                ``(image_input, global_pixel_frame_idx, strength)`` tuples
+                where ``image_input`` is anything accepted by
+                ``combined_image_conditionings``. When set, they are
+                routed to per-segment positions via :mod:`keyframe_router`
+                and **merged with** ``keyframes_per_segment``. Mirrors
+                ComfyUI ``optional_cond_images`` + ``cond_image_indices``.
             config: :class:`LoopingConfig` instance (defaults applied if None).
             tiling_config: forwarded to VAE decode.
             enhance_prompt: pass-through to ltx-pipelines prompt encoder.
@@ -255,6 +344,50 @@ class LoopingPipeline(DistilledPipeline):
                 "keyframes_per_segment length must match prompts length"
             )
 
+        # P1 — global keyframes → per-segment routing.
+        # ComfyUI ``LTXVLoopingSampler`` accepts a flat list of pixel-frame
+        # keyframe indices and computes which temporal tile each one lands
+        # in; we do the same and merge with any per-segment keyframes the
+        # caller already supplied.
+        if cond_images:
+            overlap_pixel = config.overlap_latent_frames * VAE_TEMPORAL_SCALE
+            total_pixel = total_pixel_frames(
+                len(prompts), config.chunk_num_frames, overlap_pixel
+            )
+            routes = route_keyframes(
+                [int(ci[1]) for ci in cond_images],
+                tile_size_pixel=config.chunk_num_frames,
+                overlap_pixel=overlap_pixel,
+                total_pixel_frames=total_pixel,
+                metas=list(cond_images),
+            )
+            for r in routes:
+                meta = r.meta
+                if meta is None:
+                    continue
+                img_input, _, *rest = meta
+                strength = float(rest[0]) if rest else config.cond_image_strength
+                keyframes_per_segment[r.temporal_tile_index].append(
+                    (img_input, r.in_tile_pixel_index, strength)
+                )
+
+        # P3 — shared PromptContextCache (skip when share_prompt_encoding=False
+        # to preserve the legacy per-segment encode behaviour).
+        prompt_cache: PromptContextCache | None = None
+        if config.share_prompt_encoding:
+            prompt_cache = PromptContextCache(
+                self.prompt_encoder,
+                positive_prompts=prompts,
+                negative_prompt=config.negative_prompt,
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=(
+                    keyframes_per_segment[0][0][0]
+                    if keyframes_per_segment[0]
+                    else None
+                ),
+                enhance_prompt_seed=seed,
+            )
+
         # Build the transformer ONCE for both stages — every segment reuses
         # the same context to amortise the load cost.
         # NOTE: distilled pipeline calls the same stage for both stage-1 and
@@ -267,9 +400,13 @@ class LoopingPipeline(DistilledPipeline):
         all_video_latents: list[torch.Tensor] = []
         all_audio_latents: list[torch.Tensor] = []
 
-        # Anchor latent for negative-index memory is captured after segment 0.
-        # Kept on GPU because it is re-fed into the transformer each segment.
+        # Anchor latent for negative-index memory is captured after segment 0,
+        # OR taken from ``config.external_negative_index_latent`` if provided.
         anchor_latent: torch.Tensor | None = None
+        if config.external_negative_index_latent is not None:
+            anchor_latent = config.external_negative_index_latent.to(
+                self.device, non_blocking=False
+            )
 
         for seg_idx, prompt in enumerate(prompts):
             prev_tail = None
@@ -283,14 +420,37 @@ class LoopingPipeline(DistilledPipeline):
                     .detach()
                     .clone()
                 )
+
+            # P2 — per-tile seed derivation.
+            if config.seeding_mode == "comfyui":
+                offset = per_tile_offset_for(
+                    list(config.per_tile_seed_offsets), seg_idx
+                )
+                # Pixel-frame start of this temporal tile.
+                start_pix = seg_idx * (
+                    config.chunk_num_frames
+                    - config.overlap_latent_frames * VAE_TEMPORAL_SCALE
+                )
+                seg_seed = calc_tile_seed(
+                    base_seed=seed,
+                    start_index=start_pix,
+                    vertical_tiles=1,
+                    horizontal_tiles=1,
+                    v=0,
+                    h=0,
+                    per_tile_offset=offset,
+                )
+            else:
+                seg_seed = seed + seg_idx
+
             logger.info(
-                "[long-video] segment %d/%d prompt=%r",
-                seg_idx + 1, len(prompts), prompt[:60],
+                "[long-video] segment %d/%d seed=%d prompt=%r",
+                seg_idx + 1, len(prompts), seg_seed, prompt[:60],
             )
 
             video_latent, audio_latent = self.generate_one_segment(
                 prompt=prompt,
-                seed=seed + seg_idx,
+                seed=seg_seed,
                 height=height,
                 width=width,
                 num_frames=config.chunk_num_frames,
@@ -302,22 +462,38 @@ class LoopingPipeline(DistilledPipeline):
                 ),
                 config=config,
                 enhance_prompt=enhance_prompt and seg_idx == 0,  # only first
+                prompt_contexts=(
+                    (prompt_cache.positive_for(seg_idx), prompt_cache.negative)
+                    if prompt_cache is not None
+                    else None
+                ),
+                tile_index=seg_idx,
             )
             if prev_tail is not None:
                 del prev_tail
 
-            # AdaIN against the first segment to halt colour drift. Pull the
-            # reference back to ``video_latent``'s device for the match; the
-            # result inherits ``video_latent.device``.
+            # P5 — AdaIN: prefer external normalizing latent if provided,
+            # otherwise fall back to the first-segment reference.
             if seg_idx > 0 and config.adain_factor > 0:
-                ref = all_video_latents[0].to(video_latent.device, non_blocking=False)
+                if config.external_normalizing_latent is not None:
+                    ref = config.external_normalizing_latent.to(
+                        video_latent.device, non_blocking=False
+                    )
+                else:
+                    ref = all_video_latents[0].to(
+                        video_latent.device, non_blocking=False
+                    )
                 video_latent = adain_match(video_latent, ref, factor=config.adain_factor)
                 del ref
 
             # Snapshot the anchor from segment 0 BEFORE moving to CPU. Anchor
             # is small (a couple latent frames) and lives on GPU between
-            # segments.
-            if seg_idx == 0 and config.enable_negative_index:
+            # segments. Skip if user supplied an external one already.
+            if (
+                seg_idx == 0
+                and config.enable_negative_index
+                and config.external_negative_index_latent is None
+            ):
                 anchor_latent = slice_anchor(
                     video_latent,
                     config.negative_index_anchor_latent_frames,
@@ -449,6 +625,11 @@ class LoopingPipeline(DistilledPipeline):
         anchor_latent: torch.Tensor | None,
         config: LoopingConfig,
         enhance_prompt: bool = False,
+        prompt_contexts: tuple[
+            tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None = None,
+        tile_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the distilled 2-stage pipeline for a single segment.
 
@@ -459,17 +640,39 @@ class LoopingPipeline(DistilledPipeline):
         L87) but injects extra conditionings for the overlap and the
         negative-index anchor. It is the unit of work consumed by the
         spatial-tiling wrapper.
+
+        Args:
+            prompt_contexts: optional pre-encoded ``((pos_v, pos_a),
+                (neg_v, neg_a))`` from a :class:`PromptContextCache`.
+                When supplied, the per-segment ``prompt_encoder`` call is
+                skipped (P3 — shared prompt encoding).
+            tile_index: this segment's temporal tile index, for logging /
+                forward-compat hooks.
         """
         dtype = torch.bfloat16
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
 
-        (ctx_p,) = self.prompt_encoder(
-            [prompt],
-            enhance_first_prompt=enhance_prompt,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+        if prompt_contexts is not None:
+            (video_context, audio_context), _neg_unused = prompt_contexts
+        else:
+            (ctx_p,) = self.prompt_encoder(
+                [prompt],
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            )
+            video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+
+        # P6 — optionally wrap the denoiser to apply DynamicConditioning
+        # power schedule each step (mutates ``video_state.denoise_mask``).
+        dyn_cfg = DynamicConditioningConfig(
+            enabled=config.dynamic_conditioning_enabled,
+            power=config.dynamic_conditioning_power,
+            only_first_frame=config.dynamic_conditioning_only_first_frame,
         )
-        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        denoiser_s1 = maybe_wrap_denoiser(
+            SimpleDenoiser(video_context, audio_context), dyn_cfg
+        )
 
         # ----------------- Stage 1: low-res generation ---------------------
         stage_1_sigmas = config.stage_1_sigmas.to(
@@ -503,7 +706,7 @@ class LoopingPipeline(DistilledPipeline):
         )
 
         video_state, audio_state = self.stage(
-            denoiser=SimpleDenoiser(video_context, audio_context),
+            denoiser=denoiser_s1,
             sigmas=stage_1_sigmas,
             noiser=noiser,
             width=stage_1_w,
@@ -541,7 +744,9 @@ class LoopingPipeline(DistilledPipeline):
         )
 
         video_state, audio_state = self.stage(
-            denoiser=SimpleDenoiser(video_context, audio_context),
+            denoiser=maybe_wrap_denoiser(
+                SimpleDenoiser(video_context, audio_context), dyn_cfg
+            ),
             sigmas=stage_2_sigmas,
             noiser=noiser,
             width=width,
@@ -572,6 +777,34 @@ class LoopingPipeline(DistilledPipeline):
         anchor_latent: torch.Tensor | None,
         config: LoopingConfig,
     ) -> list:
+        # P4 — ``use_extend_sampler``: switch overlap conditioning from
+        # ``VideoConditionByKeyframeIndex`` (frame-level RoPE injection) to
+        # ``VideoConditionByLatentIndex`` (clean prefix at latent_idx=0).
+        # The latter pins the prefix tokens via denoise_mask=0 so only the
+        # remaining tile frames are denoised — the mechanism ComfyUI uses
+        # in ``LTXVExtendSampler``.
+        if (
+            config.use_extend_sampler
+            and prev_tail_latent is not None
+            and config.overlap_latent_frames > 0
+        ):
+            extend_conds = build_extend_conditioning(
+                ExtendPrefixSpec(
+                    prefix_latent=prev_tail_latent,
+                    strength=config.overlap_strength,
+                    latent_idx=0,
+                )
+            )
+            negative: NegativeIndexSpec | None = None
+            if anchor_latent is not None and config.enable_negative_index:
+                negative = NegativeIndexSpec(
+                    anchor_latent=anchor_latent,
+                    negative_frame_idx=config.negative_frame_offset,
+                    strength=config.negative_index_strength,
+                    num_pixel_frames=max(8 * anchor_latent.shape[2], 2),
+                )
+            return extend_conds + build_video_conditionings(negative_index=negative)
+
         overlap: OverlapSpec | None = None
         if prev_tail_latent is not None and config.overlap_latent_frames > 0:
             overlap = OverlapSpec(
@@ -668,6 +901,11 @@ class TwoStagesLoopingPipeline(LoopingPipeline):
         anchor_latent: torch.Tensor | None,
         config: LoopingConfig,
         enhance_prompt: bool = False,
+        prompt_contexts: tuple[
+            tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None = None,
+        tile_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -675,14 +913,23 @@ class TwoStagesLoopingPipeline(LoopingPipeline):
         noiser = GaussianNoiser(generator=generator)
         dtype = torch.bfloat16
 
-        ctx_p, ctx_n = self.prompt_encoder(
-            [prompt, config.negative_prompt],
-            enhance_first_prompt=enhance_prompt,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
+        if prompt_contexts is not None:
+            (v_context_p, a_context_p), (v_context_n, a_context_n) = prompt_contexts
+        else:
+            ctx_p, ctx_n = self.prompt_encoder(
+                [prompt, config.negative_prompt],
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+                enhance_prompt_seed=seed,
+            )
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+
+        dyn_cfg = DynamicConditioningConfig(
+            enabled=config.dynamic_conditioning_enabled,
+            power=config.dynamic_conditioning_power,
+            only_first_frame=config.dynamic_conditioning_only_first_frame,
         )
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         stage_1_h, stage_1_w = height // 2, width // 2
         stage_1_image_conds = self.image_conditioner(
@@ -709,7 +956,7 @@ class TwoStagesLoopingPipeline(LoopingPipeline):
             steps=config.num_inference_steps
         ).to(dtype=torch.float32, device=self.device)
         video_state, audio_state = self.stage_1(
-            denoiser=FactoryGuidedDenoiser(
+            denoiser=maybe_wrap_denoiser(FactoryGuidedDenoiser(
                 v_context=v_context_p,
                 a_context=a_context_p,
                 video_guider_factory=create_multimodal_guider_factory(
@@ -720,7 +967,7 @@ class TwoStagesLoopingPipeline(LoopingPipeline):
                     params=config.audio_guider_params,
                     negative_context=a_context_n,
                 ),
-            ),
+            ), dyn_cfg),
             sigmas=stage_1_sigmas,
             noiser=noiser,
             width=stage_1_w,
@@ -756,7 +1003,9 @@ class TwoStagesLoopingPipeline(LoopingPipeline):
         )
 
         video_state, audio_state = self.stage_2(
-            denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
+            denoiser=maybe_wrap_denoiser(
+                SimpleDenoiser(v_context=v_context_p, a_context=a_context_p), dyn_cfg
+            ),
             sigmas=stage_2_sigmas,
             noiser=noiser,
             width=width,
@@ -865,6 +1114,11 @@ class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
         anchor_latent: torch.Tensor | None,
         config: LoopingConfig,
         enhance_prompt: bool = False,
+        prompt_contexts: tuple[
+            tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+        ]
+        | None = None,
+        tile_index: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -872,14 +1126,23 @@ class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
         noiser = GaussianNoiser(generator=generator)
         dtype = torch.bfloat16
 
-        ctx_p, ctx_n = self.prompt_encoder(
-            [prompt, config.negative_prompt],
-            enhance_first_prompt=enhance_prompt,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
+        if prompt_contexts is not None:
+            (v_context_p, a_context_p), (v_context_n, a_context_n) = prompt_contexts
+        else:
+            ctx_p, ctx_n = self.prompt_encoder(
+                [prompt, config.negative_prompt],
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+                enhance_prompt_seed=seed,
+            )
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+
+        dyn_cfg = DynamicConditioningConfig(
+            enabled=config.dynamic_conditioning_enabled,
+            power=config.dynamic_conditioning_power,
+            only_first_frame=config.dynamic_conditioning_only_first_frame,
         )
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         stage_1_h, stage_1_w = height // 2, width // 2
         stage_1_shape = VideoPixelShape(
@@ -912,7 +1175,7 @@ class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
         ).to(dtype=torch.float32, device=self.device)
         stepper = Res2sDiffusionStep()
         video_state, audio_state = self.stage_1(
-            denoiser=GuidedDenoiser(
+            denoiser=maybe_wrap_denoiser(GuidedDenoiser(
                 v_context=v_context_p,
                 a_context=a_context_p,
                 video_guider=MultiModalGuider(
@@ -923,7 +1186,7 @@ class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
                     params=config.audio_guider_params,
                     negative_context=a_context_n,
                 ),
-            ),
+            ), dyn_cfg),
             sigmas=stage_1_sigmas,
             noiser=noiser,
             stepper=stepper,
@@ -961,7 +1224,9 @@ class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
         )
 
         video_state, audio_state = self.stage_2(
-            denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
+            denoiser=maybe_wrap_denoiser(
+                SimpleDenoiser(v_context=v_context_p, a_context=a_context_p), dyn_cfg
+            ),
             sigmas=stage_2_sigmas,
             noiser=noiser,
             stepper=stepper,

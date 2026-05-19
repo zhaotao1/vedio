@@ -73,3 +73,45 @@ prompts:
 #   - [["./refs/anchor_seg1.png", 0, 0.9]]
 #   - []
 #   - []
+
+# ---------------------------------------------------------------------------
+# ComfyUI LTXVLoopingSampler-aligned options (all OPT-IN; defaults preserve
+# the legacy behaviour above so old configs run unchanged).
+# ---------------------------------------------------------------------------
+
+# Global keyframes (pixel-frame index across the full timeline); the runner
+# routes each one to the matching temporal tile via core/keyframe_router.
+# cond_images:
+#   - {path: "./refs/anchor_start.png",  frame_idx: 0,   strength: 0.9}
+#   - {path: "./refs/anchor_middle.png", frame_idx: 240, strength: 0.7}
+
+# Sampler / seeding controls — mirrors ComfyUI ``LTXVLoopingSampler``.
+# sampler:
+#   share_prompt_encoding: true       # P3: shared PromptContextCache
+#   use_extend_sampler: true          # P4: clean-prefix overlap (VideoConditionByLatentIndex)
+#   seeding_mode: comfyui             # 'comfyui' | 'per_segment_legacy'
+#   per_tile_seed_offsets: [0, 1, 2]  # repeats the last value as needed
+#   cond_image_strength: 1.0
+#   guiding_strength: 1.0             # P8 (placeholder; IC-LoRA not wired yet)
+#   guiding_start_step: 0
+#   guiding_end_step: 1000
+
+# Recommended new home for negative-index settings (looping: keys above
+# remain accepted for backward compatibility).
+# negative_index:
+#   enabled: true
+#   anchor_latent_frames: 2
+#   strength: 0.3
+#   frame_offset: -16
+#   external_latents_path: ./refs/neg_anchor.pt  # P5: override captured anchor
+
+# P6 — DynamicConditioning: raise denoise_mask to ``power`` each step.
+# dynamic_conditioning:
+#   enabled: true
+#   power: 1.3
+#   only_first_frame: true
+
+# P5 — external reference latents.
+# references:
+#   normalizing_latents_path: ./refs/colour_ref.pt    # AdaIN reference
+#   guiding_latents_path: ./refs/guide.pt             # P8 placeholder

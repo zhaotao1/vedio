@@ -57,12 +57,12 @@ def test_temporal_overlap_zero_is_concat():
 
 
 def test_plan_tile_grid_single_tile():
-    tiles = plan_tile_grid(total_px=704, tile_px=704, overlap_px=128)
+    tiles = plan_tile_grid(full_size_px=704, tile_size_px=704, overlap_px=128)
     assert tiles == [(0, 704)]
 
 
 def test_plan_tile_grid_multi_tile():
-    tiles = plan_tile_grid(total_px=1408, tile_px=704, overlap_px=128)
+    tiles = plan_tile_grid(full_size_px=1408, tile_size_px=704, overlap_px=128)
     assert len(tiles) >= 2
     # covers the full range
     assert tiles[0][0] == 0

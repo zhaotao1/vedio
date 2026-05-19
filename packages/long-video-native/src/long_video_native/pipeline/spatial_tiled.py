@@ -190,11 +190,38 @@ class SpatialTiledLoopingPipeline:
 
                     # Per-tile seed: differs across (seg, v, h) so each tile
                     # gets independent noise — prevents repeating patterns.
-                    tile_seed = (
-                        seed
-                        + seg_idx * (n_v * n_h)
-                        + (v_idx * n_h + h_idx) * spatial_config.per_tile_seed_stride
-                    )
+                    # ``looping_config.seeding_mode='comfyui'`` switches to
+                    # the ComfyUI ``calc_tile_seed`` formula
+                    # (base + start*V*H + v*H + h + per_tile_offset).
+                    if looping_config.seeding_mode == "comfyui":
+                        from long_video_native.core.seeding import (  # noqa: PLC0415
+                            calc_tile_seed,
+                            per_tile_offset_for,
+                        )
+                        overlap_pix = (
+                            looping_config.overlap_latent_frames * 8
+                        )
+                        start_pix = seg_idx * (
+                            looping_config.chunk_num_frames - overlap_pix
+                        )
+                        tile_seed = calc_tile_seed(
+                            base_seed=seed,
+                            start_index=start_pix,
+                            vertical_tiles=n_v,
+                            horizontal_tiles=n_h,
+                            v=v_idx,
+                            h=h_idx,
+                            per_tile_offset=per_tile_offset_for(
+                                list(looping_config.per_tile_seed_offsets),
+                                v_idx * n_h + h_idx,
+                            ),
+                        )
+                    else:
+                        tile_seed = (
+                            seed
+                            + seg_idx * (n_v * n_h)
+                            + (v_idx * n_h + h_idx) * spatial_config.per_tile_seed_stride
+                        )
 
                     prev_tail = memory.get_tail(v_idx, h_idx)
                     anchor = (
