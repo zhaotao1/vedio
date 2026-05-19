@@ -506,6 +506,33 @@ class LoopingPipeline(DistilledPipeline):
                 torch.cuda.empty_cache()
                 gc.collect()
 
+            # --- diagnostics: per-segment latent statistics ---------------
+            # Drift detector. If ``std`` collapses toward 0 or ``mean``
+            # drifts hard between segments, the negative-index anchor /
+            # AdaIN / overlap blend is over-constraining. Look for:
+            #   * std monotonically shrinking across segments → collapse
+            #   * mean drifting toward the first segment's mean → AdaIN/anchor pull
+            #   * tail_std << full_std → end-of-segment fade-to-black
+            with torch.no_grad():
+                vl = video_latent.float()
+                tail_n = min(
+                    config.overlap_latent_frames if config.overlap_latent_frames > 0 else 1,
+                    vl.shape[2],
+                )
+                tail = vl[:, :, -tail_n:, :, :]
+                head = vl[:, :, :tail_n, :, :]
+                logger.info(
+                    "[long-video] segment %d/%d stats: "
+                    "shape=%s mean=%.4f std=%.4f | head(mean=%.4f std=%.4f) "
+                    "tail(mean=%.4f std=%.4f) abs_max=%.3f",
+                    seg_idx + 1, len(prompts),
+                    tuple(vl.shape),
+                    vl.mean().item(), vl.std().item(),
+                    head.mean().item(), head.std().item(),
+                    tail.mean().item(), tail.std().item(),
+                    vl.abs().max().item(),
+                )
+
             all_video_latents.append(video_latent)
             all_audio_latents.append(audio_latent)
 
@@ -563,6 +590,25 @@ class LoopingPipeline(DistilledPipeline):
             full_video_latent.device,
             config.streaming_decode,
         )
+        # Per-quarter latent-frame stats on the assembled timeline. If the
+        # last quarter's std collapses (≪ first quarter's std), generation
+        # itself faded out before decode. If std is healthy here but the
+        # rendered video is still black at the tail, the leak is in decode
+        # / encode (look at streaming-decode chunk logs).
+        with torch.no_grad():
+            fvl = full_video_latent.float()
+            t = fvl.shape[2]
+            if t >= 4:
+                q = t // 4
+                for qi, (s, e) in enumerate([(0, q), (q, 2 * q), (2 * q, 3 * q), (3 * q, t)]):
+                    seg = fvl[:, :, s:e, :, :]
+                    logger.info(
+                        "[long-video] timeline quarter %d/4 [latent %d:%d] "
+                        "mean=%.4f std=%.4f abs_max=%.3f",
+                        qi + 1, s, e,
+                        seg.mean().item(), seg.std().item(), seg.abs().max().item(),
+                    )
+            del fvl
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Decode audio BEFORE entering the video-decode persistent context.

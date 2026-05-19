@@ -1,0 +1,119 @@
+# ============================================================================
+# 20 秒测试场景（24 fps × 509 帧 ≈ 21.2 秒）
+# ============================================================================
+# 时长计算：
+#   chunk_num_frames        = 121   每段像素帧数（必须满足 8K+1）
+#   overlap_latent_frames   = 3     段间 latent 帧重叠 → 24 像素帧重叠
+#   每段净增帧               = 121 - 24 = 97
+#   5 段总帧数               = 121 + 4 × 97 = 509
+#   时长                    = 509 / 24 ≈ 21.2 秒
+#
+# 运行：
+#   ltxv-long-video --config packages/long-video-native/examples/scene_20s.yaml
+# ============================================================================
+
+# ----------------------------- 模型路径 -------------------------------------
+model:
+  checkpoint_path: ~/models/ltxv2/ltx-2.3-22b-dev.safetensors    # 主模型 22B dev
+  distilled_lora_path: ~/models/ltxv2/distilled-lora.safetensors # 蒸馏 LoRA（加速第二阶段）
+  spatial_upsampler_path: ~/models/ltxv2/upsampler.safetensors   # 空间 2× 上采样器
+  gemma_root: ~/models/gemma-3                                   # Prompt Encoder（Gemma-3）
+  loras: []                                                      # 额外角色/风格 LoRA：[[path, strength], ...]
+  quantization: null                                             # null | fp8-cast | fp8-scaled-mm
+  offload: none                                                  # none | cpu | disk —— 显存不够再换 cpu
+  compile: false                                                 # torch.compile（首次编译耗时长）
+
+# ----------------------------- 管线模式 -------------------------------------
+pipeline:
+  mode: two_stages_hq           # two_stages（快）| two_stages_hq（高质，默认 15 步）
+
+# ----------------------------- 全局参数 -------------------------------------
+common:
+  height: 704                   # 必须 64 的倍数（两阶段约束）
+  width: 1216                   # 必须 64 的倍数
+  frame_rate: 24.0              # 输出 fps
+  seed: 42                      # 主种子（每段在 sampler.seeding_mode 下派生）
+  output_path: ./out/test_20s.mp4
+  enhance_prompt: false         # 是否启用 Gemma 增强 prompt（仅对第一段生效）
+
+# ----------------------------- 时间循环 -------------------------------------
+looping:
+  chunk_num_frames: 121         # 每段像素帧数，必须满足 (n-1) % 8 == 0
+  overlap_latent_frames: 3      # 段间 latent 重叠帧数（× 8 = 像素重叠帧）
+  overlap_strength: 0.5         # 重叠区原帧保留权重 [0,1]；越大越接近上段尾部
+  adain_factor: 0.5             # 颜色对齐强度 [0,1]；0=关，1=完全匹配首段
+  # 流式解码 —— 解码时按宏块串行下盘，把 GPU 峰值显存压到单段大小
+  streaming_decode: true
+  streaming_chunk_latent_frames: 32   # 每次解码的 latent 帧数
+  streaming_overlap_latent_frames: 4  # 宏块间 latent 重叠（线性混合消除接缝）
+
+# ----------------------------- 引导参数 -------------------------------------
+guidance:
+  num_inference_steps: 15       # 采样步数：two_stages=30，HQ=15
+  max_batch_size: 1             # transformer 单次 forward 的 batch 上限
+  # negative_prompt: "blurry, low quality, artifacts"   # 可覆盖默认负向 prompt
+  # video:                       # 视频模态引导（CFG + STG）
+  #   cfg_scale: 3.0
+  #   stg_scale: 1.0
+  #   stg_blocks: [28]
+  # audio:                       # 音频模态引导
+  #   cfg_scale: 7.0
+  #   stg_scale: 1.0
+  #   stg_blocks: [28]
+
+# ============================================================================
+# ComfyUI LTXVLoopingSampler 对齐特性（全部 opt-in；不写就是 legacy 行为）
+# ============================================================================
+
+# ---------------------- 采样器 / 种子控制（P2 + P3 + P4） -------------------
+sampler:
+  share_prompt_encoding: true   # P3 —— 所有段共享 PromptContextCache（一次批量 encode）
+                                #       省时 + 消除段间编码漂移
+  use_extend_sampler: true      # P4 —— 段间用 clean-prefix 注入（VideoConditionByLatentIndex）
+                                #       替换像素空间 blend，连贯性更好
+  seeding_mode: comfyui         # P2 —— 种子公式：base + start*V*H + v*H + h + offset
+                                #       legacy 模式直接 base + segment_idx
+  # per_tile_seed_offsets: [0, 1, 2]   # 每个 tile 的额外偏移，列表末尾会被重复
+  # cond_image_strength: 1.0    # 全局 keyframe 默认强度
+
+# ---------------------- 负索引长期记忆锚（P5 可外接） -----------------------
+negative_index:
+  enabled: true                 # 是否启用负索引锚（缓解长视频遗忘）
+  anchor_latent_frames: 2       # 从首段头部截多少 latent 帧作为锚
+  strength: 0.3                 # 锚 token 注入强度 [0,1]
+  frame_offset: -16             # 在 RoPE 上的负偏移（必须 < 0）
+  # external_latents_path: ./refs/neg_anchor.pt   # P5：用外部 latent 覆盖自动截取
+
+# ---------------------- DynamicConditioning（P6） ---------------------------
+dynamic_conditioning:
+  enabled: false                # 开启后每步 denoise_mask **= power，锚随步数衰减
+  power: 1.3                    # > 1：随步释放约束；< 1：越来越紧
+  only_first_frame: true        # 仅作用于首帧 token（当前实现等价于全 mask）
+
+# ---------------------- 全局 keyframes（P1） --------------------------------
+# 像素帧索引是相对整条时间线的，runner 自动路由到对应段
+# cond_images:
+#   - {path: ./refs/start.png,  frame_idx: 0,   strength: 0.9}
+#   - {path: ./refs/middle.png, frame_idx: 240, strength: 0.7}
+
+# ---------------------- 外部参考 latent（P5） -------------------------------
+# references:
+#   normalizing_latents_path: ./refs/colour_ref.pt   # AdaIN 颜色参考
+#   guiding_latents_path: ./refs/guide.pt            # P8 占位（暂未接通）
+
+# ----------------------------- 分段 Prompt ----------------------------------
+prompts:
+  - "A woman walks into a neon-lit cafe at night, slow tracking shot, cinematic lighting"
+  - "She sits at the bar; the bartender pours hot coffee into a ceramic cup, steam curls upward"
+  - "Close-up: she lifts the cup with both hands and takes a slow sip, soft amber rim light"
+  - "She looks out the rainy window, thoughtful; reflections shimmer on the wet glass"
+  - "Wide shot: the cafe glows warm against the dark street, rain falling in the foreground"
+
+# ----------------------------- 分段 keyframes（可选） -----------------------
+# 与 prompts 等长，每项是 [(path, in_segment_pixel_idx, strength), ...]
+# keyframes_per_segment:
+#   - []
+#   - [["./refs/anchor_seg1.png", 0, 0.9]]
+#   - []
+#   - []
+#   - []

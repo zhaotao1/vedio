@@ -1,0 +1,2 @@
+[console_scripts]
+ltxv-long-video = long_video_native.runner:main
