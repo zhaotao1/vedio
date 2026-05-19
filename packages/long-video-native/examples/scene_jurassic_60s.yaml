@@ -14,38 +14,44 @@
 # NOTE: bf16 + 704×1216 will push per-tile VAE peak to ~40-60 GB. If we OOM
 # during decode, the first thing to try is quantization: fp8-cast.
 
-model:
-  distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors
-  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
-  gemma_root:                /root/sj-tmp/models/gemma-3-12b
-  loras: []
-  quantization: none      # bf16 weights, no fp8 cast — highest fidelity
-  offload: cpu
-  compile: false
+model:  # 模型与权重路径配置
+  checkpoint_path:           /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-dev.safetensors  # full/dev 主模型，two_stages 与 two_stages_hq 使用
+  distilled_lora_path:       /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-distilled-lora-384-1.1.safetensors  # 蒸馏 LoRA，用于二阶段精修加速
+  spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors  # x2 空间放大器，把 stage1 低分辨率 latent 放大到目标分辨率
+  gemma_root:                /root/sj-tmp/models/gemma-3-12b  # Gemma 文本编码器目录
+  loras: []  # 额外角色/风格 LoRA 列表，格式如 [[path, strength]]，空列表表示不用
+  quantization: none  # 权重量化策略；none 表示 bf16 原精度，画质最高但显存占用最大
+  offload: cpu  # 权重卸载策略；cpu 表示不用的模块临时放 CPU，降低显存峰值
+  compile: false  # 是否启用 torch.compile；首次编译慢，调试/短任务建议关闭
 
-common:
-  height:      704
-  width:       1216
-  frame_rate:  24.0
-  seed:        0
-  output_path: /tmp/scene_jurassic_60s.mp4
-  enhance_prompt: false   # Gemma-3 bf16 sampling unstable → NaN crash; disabled
+pipeline:  # 选择底层生成管线
+  # two_stages_hq is the recommended first smoke test; switch to two_stages
+  # for the standard CFG/STG two-stage sampler.
+  mode: two_stages_hq  # 可选 two_stages_hq 或 two_stages；HQ 使用 Res2S sampler，建议先测
 
-looping:
-  chunk_num_frames: 121         # 8*15+1, 每段 ≈5s
-  overlap_latent_frames: 4
-  overlap_strength: 0.6
-  enable_negative_index: true
-  negative_index_anchor_latent_frames: 2
-  negative_index_strength: 0.3
-  negative_frame_offset: -16
-  adain_factor: 0.5
+common:  # 通用视频参数
+  height:      704  # 输出视频高度，必须能被 64 整除
+  width:       1216  # 输出视频宽度，必须能被 64 整除
+  frame_rate:  24.0  # 输出帧率，24fps 适合电影感
+  seed:        0  # 随机种子，固定后便于复现实验
+  output_path: /tmp/scene_jurassic_60s.mp4  # 最终 mp4 输出路径
+  enhance_prompt: false  # 是否启用 Gemma 改写提示词；当前关闭以避免 bf16 采样 NaN
+
+looping:  # 长视频分段、拼接与一致性控制
+  chunk_num_frames: 121  # 每段像素帧数；8*15+1，约 5 秒，必须满足 8K+1
+  overlap_latent_frames: 4  # 相邻段重叠的 latent 帧数；1 latent 帧约 8 像素帧
+  overlap_strength: 0.6  # 上一段尾部作为下一段条件的强度，越大衔接越稳但越受上一段约束
+  enable_negative_index: true  # 是否启用负索引长期记忆锚点，帮助多段保持整体一致
+  negative_index_anchor_latent_frames: 2  # 从首段保留多少 latent 帧作为长期记忆锚点
+  negative_index_strength: 0.3  # 长期记忆锚点条件强度，过高可能让画面过度回到开头
+  negative_frame_offset: -16  # 负索引锚点放在虚拟过去的位置，必须小于 0
+  adain_factor: 0.5  # latent AdaIN 色彩/风格匹配强度，用于降低多段色彩漂移
   # Level-2 streaming decode: keep assembled latent on CPU, decode in
   # 16-latent-frame macro-chunks (≈ 128 pixel frames each) with a 4-latent
   # cross-fade for smoother chunk stitching.
-  streaming_decode: true
-  streaming_chunk_latent_frames: 16
-  streaming_overlap_latent_frames: 4
+  streaming_decode: true  # 是否启用流式 VAE 解码，把完整 latent 放 CPU 后分块解码以防 OOM
+  streaming_chunk_latent_frames: 16  # 每次送入 VAE 解码的时间 macro-chunk latent 帧数
+  streaming_overlap_latent_frames: 4  # 流式解码块之间的重叠 latent 帧数，用于像素空间交叉淡入淡出
 
   # ComfyUI-style spatial grid tiling for the VAE decode (bypasses
   # ltx-core's buggy `tiled_decode`). Splits each macro-chunk latent into
@@ -54,32 +60,32 @@ looping:
   # For 704×1216 (latent 22×38) a 2×2 grid → per-tile latent ~11×19
   # (+ 4-latent overlap each side). overlap=4 → ~128 pixel-px blend band
   # which essentially hides the tile seams.
-  vae_grid_vertical_tiles: 2
-  vae_grid_horizontal_tiles: 2
-  vae_grid_overlap_latent: 4
+  vae_grid_vertical_tiles: 2  # VAE 空间网格的纵向 tile 数，越大单 tile 显存越低但更慢
+  vae_grid_horizontal_tiles: 2  # VAE 空间网格的横向 tile 数，2x2 是当前 704x1216 的稳妥设置
+  vae_grid_overlap_latent: 4  # 空间 tile 间的 latent 重叠宽度，用于混合隐藏接缝
 
 # vae_tiling is kept only as a fallback for the chunk_latent_frames >= t_lat
 # single-shot path; with grid tiling enabled above it is unused on the
 # per-chunk path. We still ship a small spatial tile so any internal
 # ltx-core code that consults it does not OOM.
-vae_tiling:
-  temporal_tile_frames: 16
-  temporal_overlap_frames: 8
-  spatial_tile_pixels: 64
-  spatial_overlap_pixels: 32
+vae_tiling:  # ltx-core 内置 VAE tiling 兜底配置；当前 grid-tiled decode 路径基本不用它
+  temporal_tile_frames: 16  # 内置 VAE 时间 tile 帧数，保守小值可降低显存峰值
+  temporal_overlap_frames: 8  # 内置 VAE 时间 tile 重叠帧数，用于平滑时间接缝
+  spatial_tile_pixels: 64  # 内置 VAE 空间 tile 像素尺寸，兜底时使用
+  spatial_overlap_pixels: 32  # 内置 VAE 空间 tile 重叠像素，必须是 32 的倍数
 
-prompts:
-  - "Aerial wide shot soaring over a vast Jurassic valley at sunrise, lush primeval ferns, towering ancient conifers, distant volcanic mountains exhaling thin smoke, cinematic golden hour lighting, photorealistic, slow forward camera motion."
-  - "The camera descends through morning mist into a dense fern-covered jungle, shafts of warm sunlight breaking through giant ginkgo leaves, dewdrops glittering, a small flock of pterosaurs gliding across the frame, photorealistic, smooth dolly-in."
-  - "A massive herd of long-necked Brachiosaurus wading through a wide shallow river, water splashing around their legs, ripples catching the sunlight, lush vegetation on both banks, epic wide shot, cinematic, slow lateral pan."
-  - "Close-up of a Brachiosaurus lowering its enormous head to drink, water droplets falling from its lips, scales and wet skin texture in fine detail, soft warm rim light, shallow depth of field, photorealistic."
-  - "A grazing herd of Triceratops emerges from a clearing, dust kicking up under their feet, sunlight catching on their horns and frills, distant Brachiosaurus visible in the background, epic establishing shot, slow tracking camera."
-  - "Sudden tension: the herd freezes, ears twitching; the camera slowly tilts up to a dark treeline where ferns begin to tremble, dramatic shadowy lighting, ominous mood, photorealistic."
-  - "A towering Tyrannosaurus Rex bursts out from the trees in slow motion, mouth open with a deafening roar, leaves and dust exploding outward, dramatic side lighting, cinematic low-angle shot, photorealistic."
-  - "The Triceratops herd stampedes across the plain, ground shaking, T-Rex chasing through the dust cloud, fast tracking shot following the action from the side, motion blur, golden afternoon light, photorealistic."
-  - "A lone Triceratops turns to face the T-Rex, lowering its head and horns defensively, dust swirling around them, dramatic standoff, low-angle close-up, intense cinematic lighting, photorealistic."
-  - "Wide shot of the two giants clashing in slow motion, horns striking the T-Rex's flank, the T-Rex roaring and stumbling, dirt and grass flying, epic cinematic action, golden hour light."
-  - "Overhead drone shot pulling back to reveal the prehistoric valley, the T-Rex retreating into the jungle, Triceratops herd regrouping, river glittering in late afternoon sun, sweeping camera move, photorealistic."
-  - "Sunset over the Jurassic landscape, sky turning orange and purple, silhouettes of Brachiosaurus walking along the ridge line, peaceful epic vista, slow lateral camera glide, cinematic."
-  - "Night falls; bioluminescent insects light up the ferns, a full moon rises over the volcanic mountains, distant dinosaur calls echoing, calm wide shot, painterly cinematic lighting, photorealistic."
-  - "Final aerial pull-back shot rising high above the valley, revealing the entire Jurassic ecosystem under starlight, sweeping orchestral feeling, slow upward camera motion, photorealistic, epic finale."
+prompts:  # 每个条目对应一个约 5 秒的视频段，顺序决定剧情推进
+  - "Aerial wide shot soaring over a vast Jurassic valley at sunrise, lush primeval ferns, towering ancient conifers, distant volcanic mountains exhaling thin smoke, cinematic golden hour lighting, photorealistic, slow forward camera motion."  # 第 1 段：日出航拍建立场景
+  - "The camera descends through morning mist into a dense fern-covered jungle, shafts of warm sunlight breaking through giant ginkgo leaves, dewdrops glittering, a small flock of pterosaurs gliding across the frame, photorealistic, smooth dolly-in."  # 第 2 段：镜头下降进入丛林
+  - "A massive herd of long-necked Brachiosaurus wading through a wide shallow river, water splashing around their legs, ripples catching the sunlight, lush vegetation on both banks, epic wide shot, cinematic, slow lateral pan."  # 第 3 段：腕龙群过河
+  - "Close-up of a Brachiosaurus lowering its enormous head to drink, water droplets falling from its lips, scales and wet skin texture in fine detail, soft warm rim light, shallow depth of field, photorealistic."  # 第 4 段：腕龙饮水特写
+  - "A grazing herd of Triceratops emerges from a clearing, dust kicking up under their feet, sunlight catching on their horns and frills, distant Brachiosaurus visible in the background, epic establishing shot, slow tracking camera."  # 第 5 段：三角龙群登场
+  - "Sudden tension: the herd freezes, ears twitching; the camera slowly tilts up to a dark treeline where ferns begin to tremble, dramatic shadowy lighting, ominous mood, photorealistic."  # 第 6 段：危险前兆与悬念
+  - "A towering Tyrannosaurus Rex bursts out from the trees in slow motion, mouth open with a deafening roar, leaves and dust exploding outward, dramatic side lighting, cinematic low-angle shot, photorealistic."  # 第 7 段：霸王龙冲出树林
+  - "The Triceratops herd stampedes across the plain, ground shaking, T-Rex chasing through the dust cloud, fast tracking shot following the action from the side, motion blur, golden afternoon light, photorealistic."  # 第 8 段：追逐与奔逃
+  - "A lone Triceratops turns to face the T-Rex, lowering its head and horns defensively, dust swirling around them, dramatic standoff, low-angle close-up, intense cinematic lighting, photorealistic."  # 第 9 段：三角龙回身对峙
+  - "Wide shot of the two giants clashing in slow motion, horns striking the T-Rex's flank, the T-Rex roaring and stumbling, dirt and grass flying, epic cinematic action, golden hour light."  # 第 10 段：巨兽碰撞动作场面
+  - "Overhead drone shot pulling back to reveal the prehistoric valley, the T-Rex retreating into the jungle, Triceratops herd regrouping, river glittering in late afternoon sun, sweeping camera move, photorealistic."  # 第 11 段：战斗结束后拉远
+  - "Sunset over the Jurassic landscape, sky turning orange and purple, silhouettes of Brachiosaurus walking along the ridge line, peaceful epic vista, slow lateral camera glide, cinematic."  # 第 12 段：夕阳下恢复平静
+  - "Night falls; bioluminescent insects light up the ferns, a full moon rises over the volcanic mountains, distant dinosaur calls echoing, calm wide shot, painterly cinematic lighting, photorealistic."  # 第 13 段：夜幕与萤光氛围
+  - "Final aerial pull-back shot rising high above the valley, revealing the entire Jurassic ecosystem under starlight, sweeping orchestral feeling, slow upward camera motion, photorealistic, epic finale."  # 第 14 段：最终航拍收束

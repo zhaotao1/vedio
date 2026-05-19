@@ -11,13 +11,17 @@ Example::
 YAML schema (see ``scene.yaml.example``)::
 
     model:
-      distilled_checkpoint_path: /models/distilled.safetensors
+            checkpoint_path: /models/ltx-2.3-22b-dev.safetensors
+            distilled_lora_path: /models/distilled-lora.safetensors
       spatial_upsampler_path: /models/upsampler.safetensors
       gemma_root: /models/gemma-3
       loras: []                          # list of [path, strength?]
       quantization: null                 # null | fp8-cast | fp8-scaled-mm
       offload: none                      # none | cpu | disk
       compile: false
+
+        pipeline:
+            mode: two_stages_hq                # two_stages | two_stages_hq
 
     common:
       height: 704
@@ -36,6 +40,12 @@ YAML schema (see ``scene.yaml.example``)::
       negative_index_strength: 0.3
       negative_frame_offset: -16
       adain_factor: 0.5
+
+        guidance:
+            num_inference_steps: 30
+            max_batch_size: 1
+            video: {cfg_scale: 3.0, stg_scale: 1.0, stg_blocks: [28]}
+            audio: {cfg_scale: 7.0, stg_scale: 1.0, stg_blocks: [28]}
 
     spatial_tiling:                       # optional; omit for single-tile mode
       tile_height_px: 704
@@ -61,14 +71,23 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
+from ltx_pipelines.utils.constants import (
+    LTX_2_3_HQ_PARAMS,
+    LTX_2_3_PARAMS,
+)
 from ltx_pipelines.utils.args import DEFAULT_IMAGE_CRF, ImageConditioningInput
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import OffloadMode
 
-from long_video_native.pipeline.looping import LoopingConfig, LoopingPipeline
+from long_video_native.pipeline.looping import (
+    LoopingConfig,
+    TwoStagesHQLoopingPipeline,
+    TwoStagesLoopingPipeline,
+)
 from long_video_native.pipeline.spatial_tiled import (
     SpatialTiledLoopingPipeline,
     SpatialTilingConfig,
@@ -116,6 +135,21 @@ def _parse_loras(spec: list[Any] | None) -> tuple[LoraPathStrengthAndSDOps, ...]
             )
         )
     return tuple(parsed)
+
+
+def _parse_distilled_lora(
+    model_cfg: dict[str, Any],
+) -> list[LoraPathStrengthAndSDOps]:
+    spec = model_cfg.get("distilled_lora")
+    if spec is None and model_cfg.get("distilled_lora_path"):
+        spec = [[model_cfg["distilled_lora_path"], model_cfg.get("distilled_lora_strength", 1.0)]]
+    loras = list(_parse_loras(spec))
+    if not loras:
+        raise ValueError(
+            "two_stages and two_stages_hq require model.distilled_lora_path "
+            "or model.distilled_lora"
+        )
+    return loras
 
 
 def _parse_quantization(
@@ -178,6 +212,27 @@ def _parse_keyframes(
     return out
 
 
+def _parse_guider_params(
+    spec: dict[str, Any] | None,
+    default: MultiModalGuiderParams,
+) -> MultiModalGuiderParams:
+    spec = spec or {}
+    return MultiModalGuiderParams(
+        cfg_scale=float(spec.get("cfg_scale", default.cfg_scale)),
+        stg_scale=float(spec.get("stg_scale", default.stg_scale)),
+        rescale_scale=float(spec.get("rescale_scale", default.rescale_scale)),
+        modality_scale=float(spec.get("modality_scale", default.modality_scale)),
+        skip_step=int(spec.get("skip_step", default.skip_step)),
+        stg_blocks=list(spec.get("stg_blocks", default.stg_blocks)),
+    )
+
+
+def _pipeline_defaults(mode: str):
+    if mode == "two_stages_hq":
+        return LTX_2_3_HQ_PARAMS
+    return LTX_2_3_PARAMS
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -209,9 +264,15 @@ def main() -> None:
     )
 
     cfg = _load_yaml(args.config)
+    pipeline_yaml = cfg.get("pipeline") or {}
+    mode = str(pipeline_yaml.get("mode", "two_stages_hq")).lower()
+    valid_modes = {"two_stages", "two_stages_hq"}
+    if mode not in valid_modes:
+        raise ValueError(f"unknown pipeline.mode {mode!r}; expected one of {sorted(valid_modes)}")
     model_cfg = cfg.get("model") or {}
     common = cfg.get("common") or {}
     looping_yaml = cfg.get("looping") or {}
+    guidance_yaml = cfg.get("guidance") or {}
     spatial_yaml = cfg.get("spatial_tiling")  # may be absent
     prompts = cfg.get("prompts") or []
     keyframes_cfg = cfg.get("keyframes_per_segment")
@@ -220,21 +281,48 @@ def main() -> None:
         raise SystemExit("config must define a non-empty 'prompts' list")
 
     # --- build inner pipeline ---------------------------------------------
-    logger.info("Building distilled pipeline…")
-    distilled_ckpt = str(_resolve_path(model_cfg["distilled_checkpoint_path"]))
-    inner = LoopingPipeline(
-        distilled_checkpoint_path=distilled_ckpt,
-        spatial_upsampler_path=str(_resolve_path(model_cfg["spatial_upsampler_path"])),
-        gemma_root=str(_resolve_path(model_cfg["gemma_root"])),
-        loras=list(_parse_loras(model_cfg.get("loras"))),
-        quantization=_parse_quantization(
-            model_cfg.get("quantization"), distilled_ckpt
-        ),
-        torch_compile=bool(model_cfg.get("compile", False)),
-        offload_mode=_parse_offload(model_cfg.get("offload", "none")),
-    )
+    logger.info("Building %s pipeline…", mode)
+    loras = list(_parse_loras(model_cfg.get("loras")))
+    spatial_upsampler_path = str(_resolve_path(model_cfg["spatial_upsampler_path"]))
+    gemma_root = str(_resolve_path(model_cfg["gemma_root"]))
+    offload_mode = _parse_offload(model_cfg.get("offload", "none"))
+    if mode == "two_stages":
+        checkpoint_for_quant = str(_resolve_path(model_cfg["checkpoint_path"]))
+        inner = TwoStagesLoopingPipeline(
+            checkpoint_path=checkpoint_for_quant,
+            distilled_lora=_parse_distilled_lora(model_cfg),
+            spatial_upsampler_path=spatial_upsampler_path,
+            gemma_root=gemma_root,
+            loras=loras,
+            quantization=_parse_quantization(
+                model_cfg.get("quantization"), checkpoint_for_quant
+            ),
+            torch_compile=bool(model_cfg.get("compile", False)),
+            offload_mode=offload_mode,
+        )
+    else:
+        checkpoint_for_quant = str(_resolve_path(model_cfg["checkpoint_path"]))
+        inner = TwoStagesHQLoopingPipeline(
+            checkpoint_path=checkpoint_for_quant,
+            distilled_lora=_parse_distilled_lora(model_cfg),
+            spatial_upsampler_path=spatial_upsampler_path,
+            gemma_root=gemma_root,
+            loras=loras,
+            distilled_lora_strength_stage_1=float(
+                model_cfg.get("distilled_lora_strength_stage_1", 0.25)
+            ),
+            distilled_lora_strength_stage_2=float(
+                model_cfg.get("distilled_lora_strength_stage_2", 0.5)
+            ),
+            quantization=_parse_quantization(
+                model_cfg.get("quantization"), checkpoint_for_quant
+            ),
+            torch_compile=bool(model_cfg.get("compile", False)),
+            offload_mode=offload_mode,
+        )
 
     # --- build configs ----------------------------------------------------
+    defaults = _pipeline_defaults(mode)
     looping_config = LoopingConfig(
         chunk_num_frames=int(looping_yaml.get("chunk_num_frames", 121)),
         overlap_latent_frames=int(looping_yaml.get("overlap_latent_frames", 3)),
@@ -268,6 +356,19 @@ def main() -> None:
         vae_grid_overlap_latent=int(
             looping_yaml.get("vae_grid_overlap_latent", 2)
         ),
+        negative_prompt=str(
+            guidance_yaml.get("negative_prompt", LoopingConfig.negative_prompt)
+        ),
+        num_inference_steps=int(
+            guidance_yaml.get("num_inference_steps", defaults.num_inference_steps)
+        ),
+        video_guider_params=_parse_guider_params(
+            guidance_yaml.get("video"), defaults.video_guider_params
+        ),
+        audio_guider_params=_parse_guider_params(
+            guidance_yaml.get("audio"), defaults.audio_guider_params
+        ),
+        max_batch_size=int(guidance_yaml.get("max_batch_size", 1)),
     )
 
     height = int(common.get("height", 704))

@@ -3,7 +3,8 @@
 #   ltxv-long-video --config scene.yaml
 
 model:
-  distilled_checkpoint_path: ~/models/ltxv2/distilled.safetensors
+  checkpoint_path: ~/models/ltxv2/ltx-2.3-22b-dev.safetensors
+  distilled_lora_path: ~/models/ltxv2/distilled-lora.safetensors
   spatial_upsampler_path: ~/models/ltxv2/upsampler.safetensors
   gemma_root: ~/models/gemma-3
   # loras: [["~/models/character_lora.safetensors", 0.8]]
@@ -11,6 +12,9 @@ model:
   quantization: null              # null | fp8-cast | fp8-scaled-mm
   offload: none                   # none | cpu | disk
   compile: false
+
+pipeline:
+  mode: two_stages_hq             # two_stages | two_stages_hq
 
 common:
   height: 704                     # must be divisible by 64 (two-stage)
@@ -29,6 +33,26 @@ looping:
   negative_index_strength: 0.3
   negative_frame_offset: -16      # pixel frames; must be < 0
   adain_factor: 0.5               # 0 disables, 1 fully matches first segment
+
+# Optional guidance overrides.
+guidance:
+  num_inference_steps: 30          # two_stages default 30; HQ default 15
+  max_batch_size: 1
+  # negative_prompt: "blurry, low quality, artifacts"
+  # video:
+  #   cfg_scale: 3.0
+  #   stg_scale: 1.0
+  #   rescale_scale: 0.7
+  #   modality_scale: 3.0
+  #   skip_step: 0
+  #   stg_blocks: [28]
+  # audio:
+  #   cfg_scale: 7.0
+  #   stg_scale: 1.0
+  #   rescale_scale: 0.7
+  #   modality_scale: 3.0
+  #   skip_step: 0
+  #   stg_blocks: [28]
 
 # Omit `spatial_tiling:` block entirely for single-tile generation.
 # Enable below for high-resolution (e.g. 1408×2432) renders.

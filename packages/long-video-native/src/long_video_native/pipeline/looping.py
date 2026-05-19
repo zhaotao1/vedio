@@ -29,17 +29,47 @@ from dataclasses import dataclass, field
 
 import torch
 
+from ltx_core.components.diffusion_steps import Res2sDiffusionStep
+from ltx_core.components.guiders import (
+    MultiModalGuider,
+    MultiModalGuiderParams,
+    create_multimodal_guider_factory,
+)
 from ltx_core.components.noisers import GaussianNoiser
+from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.loader import LoraPathStrengthAndSDOps
+from ltx_core.loader.registry import Registry
 from ltx_core.model.video_vae import TilingConfig
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio
+from ltx_core.types import VideoLatentShape, VideoPixelShape
 from ltx_pipelines.distilled import DistilledPipeline
-from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
-from ltx_pipelines.utils.denoisers import SimpleDenoiser
+from ltx_pipelines.utils.blocks import (
+    AudioDecoder,
+    DiffusionStage,
+    ImageConditioner,
+    PromptEncoder,
+    VideoDecoder,
+    VideoUpsampler,
+)
+from ltx_pipelines.utils.constants import (
+    DEFAULT_NEGATIVE_PROMPT,
+    DISTILLED_SIGMAS,
+    LTX_2_3_PARAMS,
+    STAGE_2_DISTILLED_SIGMAS,
+)
+from ltx_pipelines.utils.denoisers import (
+    FactoryGuidedDenoiser,
+    GuidedDenoiser,
+    SimpleDenoiser,
+)
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     combined_image_conditionings,
+    get_device,
 )
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 from long_video_native.core.adain import adain_match
 from long_video_native.core.blending import temporal_overlap_blend
@@ -48,7 +78,6 @@ from long_video_native.core.conditioning_builder import (
     OverlapSpec,
     build_video_conditionings,
     slice_anchor,
-    slice_overlap_tail,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,6 +142,17 @@ class LoopingConfig:
     stage_1_sigmas: torch.Tensor = field(default_factory=lambda: DISTILLED_SIGMAS)
     stage_2_sigmas: torch.Tensor = field(default_factory=lambda: STAGE_2_DISTILLED_SIGMAS)
 
+    # Non-distilled two-stage guidance (ignored by the distilled pipeline).
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
+    num_inference_steps: int = LTX_2_3_PARAMS.num_inference_steps
+    video_guider_params: MultiModalGuiderParams = field(
+        default_factory=lambda: LTX_2_3_PARAMS.video_guider_params
+    )
+    audio_guider_params: MultiModalGuiderParams = field(
+        default_factory=lambda: LTX_2_3_PARAMS.audio_guider_params
+    )
+    max_batch_size: int = 1
+
     def __post_init__(self) -> None:
         if (self.chunk_num_frames - 1) % 8 != 0:
             raise ValueError(
@@ -137,6 +177,10 @@ class LoopingConfig:
             raise ValueError("vae_grid_*_tiles must be >= 1")
         if self.vae_grid_overlap_latent < 0:
             raise ValueError("vae_grid_overlap_latent must be >= 0")
+        if self.num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be > 0")
+        if self.max_batch_size <= 0:
+            raise ValueError("max_batch_size must be > 0")
 
 
 class LoopingPipeline(DistilledPipeline):
@@ -543,6 +587,403 @@ class LoopingPipeline(DistilledPipeline):
                 num_pixel_frames=max(8 * anchor_latent.shape[2], 2),
             )
         return build_video_conditionings(overlap=overlap, negative_index=negative)
+
+
+class TwoStagesLoopingPipeline(LoopingPipeline):
+    """Long-video wrapper around the non-distilled two-stage pipeline.
+
+    The long-video stitching/streaming decode path is inherited from
+    :class:`LoopingPipeline`; this class only swaps the per-segment latent
+    generation to the full/dev checkpoint + distilled LoRA recipe.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        distilled_lora: list[LoraPathStrengthAndSDOps],
+        spatial_upsampler_path: str,
+        gemma_root: str,
+        loras: list[LoraPathStrengthAndSDOps],
+        device: torch.device | None = None,
+        quantization: QuantizationPolicy | None = None,
+        registry: Registry | None = None,
+        torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
+    ) -> None:
+        self.device = device or get_device()
+        self.dtype = torch.bfloat16
+        self._scheduler = LTX2Scheduler()
+
+        self.prompt_encoder = PromptEncoder(
+            checkpoint_path, gemma_root, self.dtype, self.device,
+            registry=registry, offload_mode=offload_mode,
+        )
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+        self.upsampler = VideoUpsampler(
+            checkpoint_path, spatial_upsampler_path, self.dtype, self.device,
+            registry=registry,
+        )
+        self.video_decoder = VideoDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+
+        self.stage_1 = DiffusionStage(
+            checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=tuple(loras),
+            quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
+            offload_mode=offload_mode,
+        )
+        self.stage_2 = DiffusionStage(
+            checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=(*tuple(loras), *distilled_lora),
+            quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
+            offload_mode=offload_mode,
+        )
+
+    @torch.no_grad()
+    def generate_one_segment(
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list,
+        prev_tail_latent: torch.Tensor | None,
+        anchor_latent: torch.Tensor | None,
+        config: LoopingConfig,
+        enhance_prompt: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert_resolution(height=height, width=width, is_two_stage=True)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        dtype = torch.bfloat16
+
+        ctx_p, ctx_n = self.prompt_encoder(
+            [prompt, config.negative_prompt],
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+
+        stage_1_h, stage_1_w = height // 2, width // 2
+        stage_1_image_conds = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_1_h,
+                width=stage_1_w,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        extra_conds_s1 = self._build_continuity_conditionings(
+            prev_tail_latent=_maybe_resize_latent(
+                prev_tail_latent, target_h=stage_1_h // 32, target_w=stage_1_w // 32
+            ),
+            anchor_latent=_maybe_resize_latent(
+                anchor_latent, target_h=stage_1_h // 32, target_w=stage_1_w // 32
+            ),
+            config=config,
+        )
+
+        stage_1_sigmas = self._scheduler.execute(
+            steps=config.num_inference_steps
+        ).to(dtype=torch.float32, device=self.device)
+        video_state, audio_state = self.stage_1(
+            denoiser=FactoryGuidedDenoiser(
+                v_context=v_context_p,
+                a_context=a_context_p,
+                video_guider_factory=create_multimodal_guider_factory(
+                    params=config.video_guider_params,
+                    negative_context=v_context_n,
+                ),
+                audio_guider_factory=create_multimodal_guider_factory(
+                    params=config.audio_guider_params,
+                    negative_context=a_context_n,
+                ),
+            ),
+            sigmas=stage_1_sigmas,
+            noiser=noiser,
+            width=stage_1_w,
+            height=stage_1_h,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_1_image_conds + extra_conds_s1,
+            ),
+            audio=ModalitySpec(context=a_context_p),
+            max_batch_size=config.max_batch_size,
+        )
+
+        upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        stage_2_sigmas = config.stage_2_sigmas.to(
+            dtype=torch.float32, device=self.device
+        )
+        stage_2_image_conds = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        extra_conds_s2 = self._build_continuity_conditionings(
+            prev_tail_latent=prev_tail_latent,
+            anchor_latent=anchor_latent,
+            config=config,
+        )
+
+        video_state, audio_state = self.stage_2(
+            denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
+            sigmas=stage_2_sigmas,
+            noiser=noiser,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_2_image_conds + extra_conds_s2,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=upscaled_video_latent,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=audio_state.latent,
+            ),
+        )
+
+        return video_state.latent, audio_state.latent
+
+
+class TwoStagesHQLoopingPipeline(TwoStagesLoopingPipeline):
+    """Long-video wrapper around the HQ Res2S two-stage pipeline."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        distilled_lora: list[LoraPathStrengthAndSDOps],
+        spatial_upsampler_path: str,
+        gemma_root: str,
+        loras: list[LoraPathStrengthAndSDOps],
+        distilled_lora_strength_stage_1: float = 0.25,
+        distilled_lora_strength_stage_2: float = 0.5,
+        device: torch.device | None = None,
+        quantization: QuantizationPolicy | None = None,
+        registry: Registry | None = None,
+        torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
+    ) -> None:
+        self.device = device or get_device()
+        self.dtype = torch.bfloat16
+        self._scheduler = LTX2Scheduler()
+
+        distilled_lora_stage_1 = LoraPathStrengthAndSDOps(
+            path=distilled_lora[0].path,
+            strength=distilled_lora_strength_stage_1,
+            sd_ops=distilled_lora[0].sd_ops,
+        )
+        distilled_lora_stage_2 = LoraPathStrengthAndSDOps(
+            path=distilled_lora[0].path,
+            strength=distilled_lora_strength_stage_2,
+            sd_ops=distilled_lora[0].sd_ops,
+        )
+
+        self.prompt_encoder = PromptEncoder(
+            checkpoint_path, gemma_root, self.dtype, self.device,
+            registry=registry, offload_mode=offload_mode,
+        )
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+        self.upsampler = VideoUpsampler(
+            checkpoint_path, spatial_upsampler_path, self.dtype, self.device,
+            registry=registry,
+        )
+        self.video_decoder = VideoDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry
+        )
+        self.stage_1 = DiffusionStage(
+            checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=(*tuple(loras), distilled_lora_stage_1),
+            quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
+            offload_mode=offload_mode,
+        )
+        self.stage_2 = DiffusionStage(
+            checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=(*tuple(loras), distilled_lora_stage_2),
+            quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
+            offload_mode=offload_mode,
+        )
+
+    @torch.no_grad()
+    def generate_one_segment(
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list,
+        prev_tail_latent: torch.Tensor | None,
+        anchor_latent: torch.Tensor | None,
+        config: LoopingConfig,
+        enhance_prompt: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert_resolution(height=height, width=width, is_two_stage=True)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        dtype = torch.bfloat16
+
+        ctx_p, ctx_n = self.prompt_encoder(
+            [prompt, config.negative_prompt],
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+
+        stage_1_h, stage_1_w = height // 2, width // 2
+        stage_1_shape = VideoPixelShape(
+            batch=1, frames=num_frames, width=stage_1_w, height=stage_1_h,
+            fps=frame_rate,
+        )
+        stage_1_image_conds = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_1_h,
+                width=stage_1_w,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        extra_conds_s1 = self._build_continuity_conditionings(
+            prev_tail_latent=_maybe_resize_latent(
+                prev_tail_latent, target_h=stage_1_h // 32, target_w=stage_1_w // 32
+            ),
+            anchor_latent=_maybe_resize_latent(
+                anchor_latent, target_h=stage_1_h // 32, target_w=stage_1_w // 32
+            ),
+            config=config,
+        )
+
+        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+        stage_1_sigmas = self._scheduler.execute(
+            latent=empty_latent, steps=config.num_inference_steps
+        ).to(dtype=torch.float32, device=self.device)
+        stepper = Res2sDiffusionStep()
+        video_state, audio_state = self.stage_1(
+            denoiser=GuidedDenoiser(
+                v_context=v_context_p,
+                a_context=a_context_p,
+                video_guider=MultiModalGuider(
+                    params=config.video_guider_params,
+                    negative_context=v_context_n,
+                ),
+                audio_guider=MultiModalGuider(
+                    params=config.audio_guider_params,
+                    negative_context=a_context_n,
+                ),
+            ),
+            sigmas=stage_1_sigmas,
+            noiser=noiser,
+            stepper=stepper,
+            width=stage_1_w,
+            height=stage_1_h,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_1_image_conds + extra_conds_s1,
+            ),
+            audio=ModalitySpec(context=a_context_p),
+            loop=res2s_audio_video_denoising_loop,
+            max_batch_size=config.max_batch_size,
+        )
+
+        upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        stage_2_sigmas = config.stage_2_sigmas.to(
+            dtype=torch.float32, device=self.device
+        )
+        stage_2_image_conds = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
+            )
+        )
+        extra_conds_s2 = self._build_continuity_conditionings(
+            prev_tail_latent=prev_tail_latent,
+            anchor_latent=anchor_latent,
+            config=config,
+        )
+
+        video_state, audio_state = self.stage_2(
+            denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
+            sigmas=stage_2_sigmas,
+            noiser=noiser,
+            stepper=stepper,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=v_context_p,
+                conditionings=stage_2_image_conds + extra_conds_s2,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=upscaled_video_latent,
+            ),
+            audio=ModalitySpec(
+                context=a_context_p,
+                noise_scale=stage_2_sigmas[0].item(),
+                initial_latent=audio_state.latent,
+            ),
+            loop=res2s_audio_video_denoising_loop,
+        )
+
+        return video_state.latent, audio_state.latent
 
 
 # ---------------------------------------------------------------------------

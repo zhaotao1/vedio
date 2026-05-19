@@ -8,11 +8,14 @@ import pytest
 import yaml
 
 from long_video_native.runner import (
+    _parse_distilled_lora,
+    _parse_guider_params,
     _parse_keyframes,
     _parse_loras,
     _parse_offload,
     _parse_quantization,
 )
+from ltx_core.components.guiders import MultiModalGuiderParams
 
 
 def test_parse_offload_modes():
@@ -40,6 +43,34 @@ def test_parse_loras_accepts_string_or_pair(tmp_path: Path):
     assert len(out) == 2
     assert out[0].strength == 1.0
     assert out[1].strength == 0.7
+
+
+def test_parse_distilled_lora_path(tmp_path: Path):
+    f = tmp_path / "distilled-lora.safetensors"
+    f.write_text("")
+    out = _parse_distilled_lora({"distilled_lora_path": str(f)})
+    assert len(out) == 1
+    assert out[0].strength == 1.0
+
+
+def test_parse_distilled_lora_required():
+    with pytest.raises(ValueError, match="distilled_lora"):
+        _parse_distilled_lora({})
+
+
+def test_parse_guider_params_overrides_defaults():
+    default = MultiModalGuiderParams(
+        cfg_scale=3.0,
+        stg_scale=1.0,
+        rescale_scale=0.7,
+        modality_scale=3.0,
+        skip_step=0,
+        stg_blocks=[28],
+    )
+    out = _parse_guider_params({"cfg_scale": 4.0, "stg_blocks": []}, default)
+    assert out.cfg_scale == 4.0
+    assert out.stg_blocks == []
+    assert out.modality_scale == 3.0
 
 
 def test_parse_keyframes_length_mismatch():

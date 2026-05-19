@@ -5,7 +5,12 @@ Public re-exports kept minimal; users typically go through the CLI
 :class:`SpatialTiledLoopingPipeline` directly.
 """
 
-from long_video_native.pipeline.looping import LoopingPipeline, LoopingConfig
+from long_video_native.pipeline.looping import (
+    LoopingConfig,
+    LoopingPipeline,
+    TwoStagesHQLoopingPipeline,
+    TwoStagesLoopingPipeline,
+)
 from long_video_native.pipeline.spatial_tiled import (
     SpatialTiledLoopingPipeline,
     SpatialTilingConfig,
@@ -14,6 +19,8 @@ from long_video_native.pipeline.spatial_tiled import (
 __all__ = [
     "LoopingConfig",
     "LoopingPipeline",
+    "TwoStagesLoopingPipeline",
+    "TwoStagesHQLoopingPipeline",
     "SpatialTiledLoopingPipeline",
     "SpatialTilingConfig",
 ]
