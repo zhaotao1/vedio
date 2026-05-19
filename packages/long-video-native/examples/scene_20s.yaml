@@ -19,8 +19,8 @@ model:
   spatial_upsampler_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors     # 空间 2× 上采样器
   gemma_root:             /root/sj-tmp/models/gemma-3-12b                                              # Prompt Encoder（Gemma-3-12B）
   loras: []                                                      # 额外角色/风格 LoRA：[[path, strength], ...]
-  quantization: null                                             # null | fp8-cast | fp8-scaled-mm
-  offload: none                                                  # none | cpu | disk —— 显存不够再换 cpu
+  quantization: fp8-cast                                         # 22B FP16(44GB) → FP8(22GB)，质量基本无损；省下的显存留给 VAE workspace
+  offload: none                                                  # none | cpu | disk —— 保持 none 不牺牲速度
   compile: false                                                 # torch.compile（首次编译耗时长）
 
 # ----------------------------- 管线模式 -------------------------------------
@@ -44,8 +44,21 @@ looping:
   adain_factor: 0.5             # 颜色对齐强度 [0,1]；0=关，1=完全匹配首段
   # 流式解码 —— 解码时按宏块串行下盘，把 GPU 峰值显存压到单段大小
   streaming_decode: true
-  streaming_chunk_latent_frames: 32   # 每次解码的 latent 帧数
+  streaming_chunk_latent_frames: 12   # 32→12：单宏块 workspace ≈ 1/3，从根本上避免 VAE OOM
   streaming_overlap_latent_frames: 4  # 宏块间 latent 重叠（线性混合消除接缝）
+  # —— VAE 空间网格切分（在 streaming 之上再做 horizontal split，进一步压低 conv3d workspace）
+  vae_grid_horizontal_tiles: 2        # 1216 宽切 2 份
+  vae_grid_vertical_tiles: 1
+  vae_grid_overlap_latent: 2
+
+# ----------------------------- VAE 内部 tiling --------------------------------
+# 这是 conv3d workspace 的真正源头；默认 spatial_tile=768 在 1216 上几乎不切，
+# 单 tile workspace > 10GB。把它降到 512 是 OOM 的最关键根因修复。
+vae_tiling:
+  spatial_tile_pixels: 512        # 默认 768 → 512：单 tile workspace 砍 ~55%
+  spatial_overlap_pixels: 64      # 必须是 32 的倍数；64 足够消除接缝
+  temporal_tile_frames: 24        # latent 帧；24 × 8 = 192 像素帧
+  temporal_overlap_frames: 8      # 必须是 8 的倍数且 < tile
 
 # ----------------------------- 引导参数 -------------------------------------
 guidance:
