@@ -42,23 +42,22 @@ looping:
   overlap_latent_frames: 3      # 段间 latent 重叠帧数（× 8 = 像素重叠帧）
   overlap_strength: 0.5         # 重叠区原帧保留权重 [0,1]；越大越接近上段尾部
   adain_factor: 0.5             # 颜色对齐强度 [0,1]；0=关，1=完全匹配首段
-  # 流式解码 —— 解码时按宏块串行下盘，把 GPU 峰值显存压到单段大小
+  # 流式解码 —— 已验证配方（见 scene_jurassic_60s.yaml）：CPU 暂存 latent + 16 帧 macro-chunk
   streaming_decode: true
-  streaming_chunk_latent_frames: 24   # offload=cpu 释放了显存，可以加回大宏块；如仍 OOM 再降到 16
+  streaming_chunk_latent_frames: 16   # 与昨日 60s 跑通配置一致；不要加大
   streaming_overlap_latent_frames: 4  # 宏块间 latent 重叠（线性混合消除接缝）
-  # —— VAE 空间网格切分（在 streaming 之上再做 horizontal split，进一步压低 conv3d workspace）
-  vae_grid_horizontal_tiles: 2        # 1216 宽切 2 份
-  vae_grid_vertical_tiles: 1
-  vae_grid_overlap_latent: 2
+  # —— ComfyUI 风格 2×2 空间网格切分：单 tile latent ~11×19，conv3d workspace 减半再减半
+  vae_grid_vertical_tiles: 2          # 必须切纵向；只切横向单 tile 仍是 22×19 会 OOM
+  vae_grid_horizontal_tiles: 2
+  vae_grid_overlap_latent: 4          # 4 latent ≈ 128 px 混合带，看不见接缝
 
-# ----------------------------- VAE 内部 tiling --------------------------------
-# 这是 conv3d workspace 的真正源头；默认 spatial_tile=768 在 1216 上几乎不切，
-# 单 tile workspace > 10GB。把它降到 512 是 OOM 的最关键根因修复。
+# ----------------------------- VAE 内部 tiling 兜底 ---------------------------
+# 开了 vae_grid 后这套基本不走；保留极小值兜底，防止 ltx-core 内部某些路径意外 OOM
 vae_tiling:
-  spatial_tile_pixels: 512        # 默认 768 → 512：单 tile workspace 砍 ~55%
-  spatial_overlap_pixels: 64      # 必须是 32 的倍数；64 足够消除接缝
-  temporal_tile_frames: 24        # latent 帧；24 × 8 = 192 像素帧
-  temporal_overlap_frames: 8      # 必须是 8 的倍数且 < tile
+  spatial_tile_pixels: 64         # 与 60s 跑通配置一致；不要调大
+  spatial_overlap_pixels: 32      # 32 的倍数
+  temporal_tile_frames: 16        # < streaming_chunk_latent_frames
+  temporal_overlap_frames: 8
 
 # ----------------------------- 引导参数 -------------------------------------
 guidance:
