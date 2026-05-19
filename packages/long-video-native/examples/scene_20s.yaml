@@ -40,16 +40,15 @@ common:
 looping:
   chunk_num_frames: 121         # 每段像素帧数，必须满足 (n-1) % 8 == 0
   overlap_latent_frames: 3      # 段间 latent 重叠帧数（× 8 = 像素重叠帧）
-  overlap_strength: 0.5         # 重叠区原帧保留权重 [0,1]；越大越接近上段尾部
+  overlap_strength: 0.8         # ↑0.5→0.8：硬接上段尾部，消除 50/50 半透明叠加重影
   adain_factor: 0.5             # 颜色对齐强度 [0,1]；0=关，1=完全匹配首段
-  # 流式解码 —— 已验证配方（见 scene_jurassic_60s.yaml）：CPU 暂存 latent + 16 帧 macro-chunk
+  # —— 反重影：实测 VAE 只占 0.78 GB（log 已确认），关掉所有 tiling，一次性解码无接缝
   streaming_decode: true
-  streaming_chunk_latent_frames: 16   # 与昨日 60s 跑通配置一致；不要加大
-  streaming_overlap_latent_frames: 4  # 宏块间 latent 重叠（线性混合消除接缝）
-  # —— ComfyUI 风格 2×2 空间网格切分：单 tile latent ~11×19，conv3d workspace 减半再减半
-  vae_grid_vertical_tiles: 2          # 必须切纵向；只切横向单 tile 仍是 22×19 会 OOM
-  vae_grid_horizontal_tiles: 2
-  vae_grid_overlap_latent: 4          # 4 latent ≈ 128 px 混合带，看不见接缝
+  streaming_chunk_latent_frames: 96   # ↑16→96：单宏块覆盖整条 latent，无时间宏块接缝
+  streaming_overlap_latent_frames: 0  # ↑4→0：没有宏块边界 cross-fade，消除时间重影
+  vae_grid_vertical_tiles: 1          # ↑2→1：不切空间，消除中线接缝重影
+  vae_grid_horizontal_tiles: 1        # ↑2→1：同上
+  vae_grid_overlap_latent: 0          # 不切就不需要 overlap
 
 # ----------------------------- VAE 内部 tiling 兜底 ---------------------------
 # 开了 vae_grid 后这套基本不走；保留极小值兜底，防止 ltx-core 内部某些路径意外 OOM
