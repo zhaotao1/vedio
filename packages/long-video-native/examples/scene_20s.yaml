@@ -19,8 +19,8 @@ model:
   spatial_upsampler_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors     # 空间 2× 上采样器
   gemma_root:             /root/sj-tmp/models/gemma-3-12b                                              # Prompt Encoder（Gemma-3-12B）
   loras: []                                                      # 额外角色/风格 LoRA：[[path, strength], ...]
-  quantization: fp8-cast                                         # 22B FP16(44GB) → FP8(22GB)，质量基本无损；省下的显存留给 VAE workspace
-  offload: none                                                  # none | cpu | disk —— 保持 none 不牺牲速度
+  quantization: null                                             # A100(sm_80) 不支持 fp8e4nv；fp8-cast 仅 H100/L40/4090 可用
+  offload: cpu                                                   # transformer 不驻留 GPU，给 VAE workspace 让位（速度 ~1.5× 慢）
   compile: false                                                 # torch.compile（首次编译耗时长）
 
 # ----------------------------- 管线模式 -------------------------------------
