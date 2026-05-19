@@ -1,51 +1,62 @@
-# 侏罗纪场景 ~60s 测试
-# 14 段 × 121 帧 (重叠 2 latent ≈ 16 像素帧)
-# 总帧数 = 121 + 13 × (121 - 16) = 1486 帧
-# 时长 = 1486 / 24 ≈ 61.9 秒
+# 侏罗纪场景 ~50s 测试 — HQ pass
+# 14 段 × 121 帧 (重叠 4 latent ≈ 32 像素帧)
+# 总帧数 = 121 + 13 × (121 - 32) = 1278 帧
+# 时长 = 1278 / 24 ≈ 53.3 秒
+#
+# Quality knobs applied vs. previous low-res run:
+#   - resolution 512×768  → 704×1216    (~3.3× more pixels)
+#   - quantization fp8-cast → bf16       (no weight cast loss, sharper detail)
+#   - enhance_prompt false → true        (Gemma rewrites seg-0 prompt)
+#   - overlap_latent_frames 2 → 4        (smoother segment stitching)
+#   - overlap_strength 0.5 → 0.6
+#   - streaming_overlap_latent_frames 2 → 4
+#   - vae_grid_overlap_latent 2 → 4      (less visible grid seams)
+# NOTE: bf16 + 704×1216 will push per-tile VAE peak to ~40-60 GB. If we OOM
+# during decode, the first thing to try is quantization: fp8-cast.
 
 model:
   distilled_checkpoint_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors
   spatial_upsampler_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors
   gemma_root:                /root/sj-tmp/models/gemma-3-12b
   loras: []
-  quantization: fp8-cast
+  quantization: bf16
   offload: cpu
   compile: false
 
 common:
-  height:      512
-  width:       768
+  height:      704
+  width:       1216
   frame_rate:  24.0
   seed:        0
   output_path: /tmp/scene_jurassic_60s.mp4
+  enhance_prompt: true
 
 looping:
   chunk_num_frames: 121         # 8*15+1, 每段 ≈5s
-  overlap_latent_frames: 2
-  overlap_strength: 0.5
+  overlap_latent_frames: 4
+  overlap_strength: 0.6
   enable_negative_index: true
   negative_index_anchor_latent_frames: 2
   negative_index_strength: 0.3
   negative_frame_offset: -16
   adain_factor: 0.5
   # Level-2 streaming decode: keep assembled latent on CPU, decode in
-  # 16-latent-frame macro-chunks (≈ 128 pixel frames each) with a 2-latent
-  # cross-fade. This is the size of a single segment that we know decodes
-  # OK on this GPU; if even this OOMs the issue is not chunk size.
+  # 16-latent-frame macro-chunks (≈ 128 pixel frames each) with a 4-latent
+  # cross-fade for smoother chunk stitching.
   streaming_decode: true
   streaming_chunk_latent_frames: 16
-  streaming_overlap_latent_frames: 2
+  streaming_overlap_latent_frames: 4
 
   # ComfyUI-style spatial grid tiling for the VAE decode (bypasses
   # ltx-core's buggy `tiled_decode`). Splits each macro-chunk latent into
   # a vertical_tiles × horizontal_tiles grid, decodes each tile via the
   # un-tiled VAE, and blends with linear ramps over the overlap region.
-  # For 512×768 (latent 16×24) a 2×2 grid → per-tile latent ~8×12 →
-  # peak GPU well under 80 GB even with all 14 segments accumulating
-  # fragmentation. overlap_latent=2 = 64 pixel-px overlap each side.
+  # For 704×1216 (latent 22×38) a 2×2 grid → per-tile latent ~11×19
+  # (+ 4-latent overlap each side). overlap=4 → ~128 pixel-px blend band
+  # which essentially hides the tile seams.
   vae_grid_vertical_tiles: 2
   vae_grid_horizontal_tiles: 2
-  vae_grid_overlap_latent: 2
+  vae_grid_overlap_latent: 4
 
 # vae_tiling is kept only as a fallback for the chunk_latent_frames >= t_lat
 # single-shot path; with grid tiling enabled above it is unused on the
