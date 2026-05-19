@@ -14,10 +14,10 @@
 
 # ----------------------------- 模型路径 -------------------------------------
 model:
-  checkpoint_path: ~/models/ltxv2/ltx-2.3-22b-dev.safetensors    # 主模型 22B dev
-  distilled_lora_path: ~/models/ltxv2/distilled-lora.safetensors # 蒸馏 LoRA（加速第二阶段）
-  spatial_upsampler_path: ~/models/ltxv2/upsampler.safetensors   # 空间 2× 上采样器
-  gemma_root: ~/models/gemma-3                                   # Prompt Encoder（Gemma-3）
+  checkpoint_path:        /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-dev.safetensors                 # 主模型 22B dev
+  distilled_lora_path:    /root/sj-tmp/models/ltx-2.3/ltx-2.3-22b-distilled-lora-384-1.1.safetensors  # 蒸馏 LoRA（加速第二阶段）
+  spatial_upsampler_path: /root/sj-tmp/models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors     # 空间 2× 上采样器
+  gemma_root:             /root/sj-tmp/models/gemma-3-12b                                              # Prompt Encoder（Gemma-3-12B）
   loras: []                                                      # 额外角色/风格 LoRA：[[path, strength], ...]
   quantization: null                                             # null | fp8-cast | fp8-scaled-mm
   offload: none                                                  # none | cpu | disk —— 显存不够再换 cpu
