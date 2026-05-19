@@ -447,6 +447,14 @@ class LoopingPipeline(DistilledPipeline):
                 "[long-video] segment %d/%d seed=%d prompt=%r",
                 seg_idx + 1, len(prompts), seg_seed, prompt[:60],
             )
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                logger.info(
+                    "[mem] seg %d/%d BEFORE generate: allocated=%.2f GB reserved=%.2f GB",
+                    seg_idx + 1, len(prompts),
+                    torch.cuda.memory_allocated() / 1024**3,
+                    torch.cuda.memory_reserved() / 1024**3,
+                )
 
             video_latent, audio_latent = self.generate_one_segment(
                 prompt=prompt,
@@ -535,6 +543,17 @@ class LoopingPipeline(DistilledPipeline):
 
             all_video_latents.append(video_latent)
             all_audio_latents.append(audio_latent)
+
+            if torch.cuda.is_available():
+                logger.info(
+                    "[mem] seg %d/%d AFTER  generate: allocated=%.2f GB reserved=%.2f GB "
+                    "peak_allocated=%.2f GB peak_reserved=%.2f GB",
+                    seg_idx + 1, len(prompts),
+                    torch.cuda.memory_allocated() / 1024**3,
+                    torch.cuda.memory_reserved() / 1024**3,
+                    torch.cuda.max_memory_allocated() / 1024**3,
+                    torch.cuda.max_memory_reserved() / 1024**3,
+                )
 
         # --- assemble full latent timeline with overlap blending -----------
         # Blending stays on whichever device the latents live on (CPU when
