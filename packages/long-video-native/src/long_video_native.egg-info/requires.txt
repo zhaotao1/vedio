@@ -1,8 +1,0 @@
-torch>=2.3
-numpy>=1.24
-pyyaml>=6.0
-tqdm>=4.66
-
-[test]
-pytest>=7
-pytest-xdist>=3

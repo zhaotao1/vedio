@@ -30,3 +30,8 @@ models/
 # 日志
 *.log
 run_*.log
+
+# Python packaging build artifacts
+*.egg-info/
+build/
+dist/
