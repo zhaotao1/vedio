@@ -29,7 +29,7 @@ common:
   frame_rate:  24.0
   seed:        0
   output_path: /tmp/scene_jurassic_60s.mp4
-  enhance_prompt: true
+  enhance_prompt: false   # Gemma-3 bf16 sampling unstable → NaN crash; disabled
 
 looping:
   chunk_num_frames: 121         # 8*15+1, 每段 ≈5s
